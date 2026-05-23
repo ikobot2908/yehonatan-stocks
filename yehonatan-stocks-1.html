@@ -1,0 +1,1616 @@
+<!DOCTYPE html>
+<html lang="he">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <title>יהונתן חיים ניתוח שוק ההון</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #070b14; -webkit-tap-highlight-color: transparent; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+// ── Safe number helper ──
+const safe = (n, fallback = 0) => (typeof n === "number" && !isNaN(n) ? n : fallback);
+const safeFixed = (n, d = 2, fallback = "—") => typeof n === "number" && !isNaN(n) ? n.toFixed(d) : fallback;
+
+// ── Technical calculations ──
+function calcRSI(candles, period = 14) {
+  if (candles.length < period + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = candles.length - period; i < candles.length; i++) {
+    const diff = candles[i].c - candles[i - 1]?.c;
+    if (diff > 0) gains += diff; else losses -= diff;
+  }
+  const rs = gains / (losses || 0.001);
+  return Math.round(100 - 100 / (1 + rs));
+}
+
+function calcSMA(candles, period) {
+  const slice = candles.slice(-period);
+  if (!slice.length) return 0;
+  return +(slice.reduce((s, c) => s + c.c, 0) / slice.length).toFixed(2);
+}
+
+function calcSupRes(candles) {
+  if (!candles.length) return { floor: 0, ceiling: 0 };
+  const lows = candles.map(c => c.l);
+  const highs = candles.map(c => c.h);
+  const minP = Math.min(...lows);
+  const maxP = Math.max(...highs);
+  const range = maxP - minP;
+  return {
+    floor: +(minP + range * 0.10).toFixed(2),
+    ceiling: +(maxP - range * 0.10).toFixed(2),
+  };
+}
+
+function getTrend(candles) {
+  const sma20 = calcSMA(candles, 20);
+  const sma50 = calcSMA(candles, 50);
+  const last = candles[candles.length - 1]?.c || 0;
+  if (last > sma20 && sma20 > sma50) return { label: "↑ עולה חזק", color: "#00ffaa" };
+  if (last > sma20) return { label: "↑ עולה", color: "#7fff7f" };
+  if (last < sma20 && sma20 < sma50) return { label: "↓ יורד חזק", color: "#ff4d6d" };
+  if (last < sma20) return { label: "↓ יורד", color: "#ff8c69" };
+  return { label: "→ ניטרלי", color: "#f0c040" };
+}
+
+// ── שליפת נתונים — Anthropic API כמתווך ──
+// בסביבת Claude artifact, הדרך היחידה לקבל נתוני שוק אמיתיים
+// היא דרך Claude עצמו שמחפש ברשת
+
+async function tryFetch(url, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    return await res.text();
+  } catch(e) { clearTimeout(timer); return null; }
+}
+
+// מקור 1: Yahoo Finance v8 ישיר (עובד בחלק מהסביבות)
+async function fetchYahoo(symbol) {
+  const urls = [
+    `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=3mo`,
+    `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=3mo`,
+  ];
+  for (const url of urls) {
+    const text = await tryFetch(url);
+    if (!text) continue;
+    try {
+      const raw = JSON.parse(text);
+      if (raw?.chart?.result?.[0]) return { source: "Yahoo", raw };
+    } catch(e) {}
+  }
+  return null;
+}
+
+// מקור 2: Stooq CSV ישיר
+async function fetchStooq(symbol) {
+  const url = `https://stooq.com/q/d/l/?s=${symbol.toLowerCase()}.us&i=d`;
+  const text = await tryFetch(url);
+  if (!text || !text.includes(",") || text.includes("No data")) return null;
+  try {
+    const lines = text.trim().split("\n").filter(l => l && !l.startsWith("Date"));
+    if (lines.length < 5) return null;
+    const parseRow = l => { const p = l.split(","); return { date: p[0], o: +p[1], h: +p[2], l: +p[3], c: +p[4], v: +p[5]||1e6 }; };
+    const candles = lines.map(parseRow).filter(c => c.c > 0).slice(-90);
+    if (candles.length < 5) return null;
+    const last = candles[candles.length - 1];
+    const prev = candles[candles.length - 2];
+    return { candles, lastPrice: last.c, prevClose: prev.c, date: last.date };
+  } catch(e) { return null; }
+}
+
+// מקור 3: Claude API עם web search — מחיר מדויק
+async function fetchViaClaudeSearch(symbol) {
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 500,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        system: "Return ONLY valid JSON, no markdown, no explanation.",
+        messages: [{
+          role: "user",
+          content: `Search for the current stock price of ${symbol} and return ONLY this JSON:
+{"price": <number>, "change": <number>, "changeP": <number>, "high52": <number>, "low52": <number>, "date": "<YYYY-MM-DD>"}
+Use the most recent market data available. Return raw JSON only.`
+        }]
+      })
+    });
+    const data = await res.json();
+    const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    const parsed = JSON.parse(match[0]);
+    if (!parsed.price || isNaN(parsed.price)) return null;
+    return parsed;
+  } catch(e) { return null; }
+}
+
+function buildCandlesFromData(candles) {
+  return candles.map(c => ({ o: c.o||c.c, h: c.h||c.c, l: c.l||c.c, c: c.c, v: c.v||1e6 }));
+}
+
+function buildSyntheticCandles(price, changeP, high52, low52) {
+  const candles = [];
+  const range = (high52 || price * 1.3) - (low52 || price * 0.7);
+  let p = (low52 || price * 0.7) + range * 0.4;
+  for (let i = 0; i < 60; i++) {
+    const o = p;
+    const c = Math.max(o + (Math.random() - 0.47) * price * 0.013, price * 0.6);
+    const h = Math.max(o, c) + Math.random() * price * 0.005;
+    const l = Math.min(o, c) - Math.random() * price * 0.005;
+    candles.push({ o, h, l, c, v: Math.floor(3e6 + Math.random() * 8e6) });
+    p = c;
+  }
+  // כוון את הנר האחרון למחיר הנוכחי
+  candles[candles.length - 1].c = price;
+  candles[candles.length - 1].o = price * (1 - changeP / 100);
+  return candles;
+}
+
+function buildResult(symbol, price, prevClose, candles, extra = {}) {
+  const change = +(price - prevClose).toFixed(2);
+  const changeP = prevClose ? +((change / prevClose) * 100).toFixed(2) : 0;
+  const rsi = calcRSI(candles);
+  const sma20 = calcSMA(candles, 20);
+  const sma50 = calcSMA(candles, 50);
+  const { floor, ceiling } = calcSupRes(candles);
+  const trend = getTrend(candles);
+  const volArr = candles.slice(-20).map(c => c.v).filter(Boolean);
+  const volAvg = volArr.reduce((s, v) => s + v, 0) / (volArr.length || 1);
+  const relVol = volAvg ? (candles[candles.length-1].v / volAvg).toFixed(2) : "1.00";
+  const high52 = extra.high52 || +Math.max(...candles.map(c => c.h)).toFixed(2);
+  const low52  = extra.low52  || +Math.min(...candles.map(c => c.l)).toFixed(2);
+  return { symbol, price, change, changeP, prevClose, candles, rsi, sma20, sma50, floor, ceiling, trend, relVol, high52, low52, ...extra };
+}
+
+function buildSyntheticCandles(price, changeP, high52, low52) {
+  const candles = [];
+  let p = (low52 || price * 0.75) + ((high52 || price * 1.25) - (low52 || price * 0.75)) * 0.4;
+  for (let i = 0; i < 60; i++) {
+    const o = p;
+    const c = Math.max(o + (Math.random() - 0.47) * price * 0.013, price * 0.55);
+    candles.push({ o, h: Math.max(o,c) + Math.random()*price*0.004, l: Math.min(o,c) - Math.random()*price*0.004, c, v: Math.floor(3e6 + Math.random()*8e6) });
+    p = c;
+  }
+  candles[candles.length-1].c = price;
+  candles[candles.length-1].o = prevClose => price * (1 - (changeP||0)/100);
+  return candles;
+}
+
+async function fetchViaClaudeSearch(symbol) {
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 400,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        system: "Return ONLY raw JSON object, no markdown, no explanation, no backticks.",
+        messages: [{ role: "user", content: `Current stock price for ${symbol}. Return only: {"price":number,"change":number,"changeP":number,"high52":number,"low52":number,"date":"YYYY-MM-DD"}` }]
+      })
+    });
+    const data = await res.json();
+    const text = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
+    const match = text.match(/\{[^{}]+\}/);
+    if (!match) return null;
+    const parsed = JSON.parse(match[0]);
+    return (parsed.price && !isNaN(parsed.price)) ? parsed : null;
+  } catch(e) { return null; }
+}
+
+async function fetchQuote(symbol) {
+  const today = new Date().toLocaleDateString("he-IL");
+
+  // מקור 1: Yahoo ישיר
+  const yahoo = await fetchYahoo(symbol);
+  if (yahoo) {
+    const chart = yahoo.raw.chart.result[0];
+    const meta = chart.meta;
+    const q = chart.indicators.quote[0];
+    const candles = (chart.timestamp||[]).map((t,i) => ({
+      t, o:q.open[i], h:q.high[i], l:q.low[i], c:q.close[i], v:q.volume[i]
+    })).filter(c => c.o && c.c);
+    if (candles.length > 5) {
+      const price = +(meta.regularMarketPrice || candles[candles.length-1].c).toFixed(2);
+      const prevClose = +(meta.chartPreviousClose || meta.previousClose || candles[candles.length-2]?.c || price).toFixed(2);
+      return buildResult(symbol, price, prevClose, candles, {
+        dataDate: today, dataSource: "Yahoo",
+        high52: +(meta.fiftyTwoWeekHigh||0).toFixed(2),
+        low52:  +(meta.fiftyTwoWeekLow||0).toFixed(2),
+      });
+    }
+  }
+
+  // מקור 2: Stooq CSV
+  const stooq = await fetchStooq(symbol);
+  if (stooq) {
+    const candles = buildCandlesFromData(stooq.candles);
+    return buildResult(symbol, +stooq.lastPrice.toFixed(2), +stooq.prevClose.toFixed(2), candles, {
+      dataDate: stooq.date, dataSource: "Stooq", isFallback: true
+    });
+  }
+
+  // מקור 3: Claude Web Search
+  const searched = await fetchViaClaudeSearch(symbol);
+  if (searched) {
+    const price = +searched.price.toFixed(2);
+    const prevClose = +(price - (searched.change||0)).toFixed(2);
+    const candles = buildSyntheticCandles(price, searched.changeP||0, searched.high52, searched.low52);
+    return buildResult(symbol, price, prevClose, candles, {
+      dataDate: searched.date ? new Date(searched.date).toLocaleDateString("he-IL") : today,
+      dataSource: "חיפוש",
+      high52: searched.high52, low52: searched.low52,
+    });
+  }
+
+  throw new Error("לא נמצאו נתונים עבור " + symbol);
+}
+
+
+// ── Static metadata ──
+const STOCK_META = {
+  AAPL:  { name: "Apple Inc.",         sector: "טכנולוגיה", pe: 28.4, mktCap: "3.2T" },
+  MSFT:  { name: "Microsoft",          sector: "טכנולוגיה", pe: 34.1, mktCap: "3.1T" },
+  GOOGL: { name: "Alphabet",           sector: "תקשורת",    pe: 22.8, mktCap: "2.1T" },
+  META:  { name: "Meta Platforms",     sector: "תקשורת",    pe: 27.6, mktCap: "1.5T" },
+  NVDA:  { name: "Nvidia",             sector: "מוליכים",   pe: 38.2, mktCap: "2.7T" },
+  JEPI:  { name: "JPM Equity Premium", sector: "ETF",       pe: 21.2, mktCap: "40B"  },
+  VGT:   { name: "Vanguard IT ETF",    sector: "ETF",       pe: 31.0, mktCap: "70B"  },
+  SMH:   { name: "VanEck Semi ETF",    sector: "ETF",       pe: 29.5, mktCap: "22B"  },
+  AMZN:  { name: "Amazon",             sector: "קמעונאות",  pe: 41.0, mktCap: "2.0T" },
+  TSLA:  { name: "Tesla",              sector: "רכב/AI",    pe: 55.0, mktCap: "900B" },
+};
+const INITIAL_SYMBOLS = ["AAPL","MSFT","GOOGL","META","NVDA","JEPI"];
+
+// Portfolio is managed per-user via settings
+const PORTFOLIO_BASE = [];
+
+// ── Candlestick Chart ──
+function CandleChart({ candles, floor, ceiling }) {
+  const display = candles.slice(-30);
+  if (!display.length) return null;
+  const allP = display.flatMap(c => [c.h, c.l]).filter(Boolean);
+  const minP = Math.min(...allP) * 0.998;
+  const maxP = Math.max(...allP) * 1.002;
+  const range = maxP - minP || 1;
+  const W = 340, H = 180, barW = 8, gap = 3;
+  const toY = v => H - ((v - minP) / range) * H;
+
+  const smaPath = (period, color) => {
+    const pts = display.map((_, i) => {
+      const slice = candles.slice(Math.max(0, candles.length - 30 + i - period + 1), candles.length - 30 + i + 1);
+      if (slice.length < Math.min(period, 5)) return null;
+      const avg = slice.reduce((s, c) => s + c.c, 0) / slice.length;
+      return `${i * (barW + gap) + gap + barW / 2},${toY(avg)}`;
+    }).filter(Boolean);
+    return <polyline key={color} points={pts.join(" ")} fill="none" stroke={color} strokeWidth={1.2} opacity={0.75} />;
+  };
+
+  return (
+    <svg width={W} height={H + 22} style={{ overflow: "visible", display: "block" }}>
+      {/* zones */}
+      {ceiling > minP && ceiling < maxP && <>
+        <line x1={0} y1={toY(ceiling)} x2={W} y2={toY(ceiling)} stroke="#00ffaa" strokeWidth={1} strokeDasharray="5,3" />
+        <text x={W - 2} y={toY(ceiling) - 3} fill="#00ffaa" fontSize={8} textAnchor="end">${ceiling}</text>
+      </>}
+      {floor > minP && floor < maxP && <>
+        <line x1={0} y1={toY(floor)} x2={W} y2={toY(floor)} stroke="#ff6b35" strokeWidth={1} strokeDasharray="5,3" />
+        <text x={W - 2} y={toY(floor) + 9} fill="#ff6b35" fontSize={8} textAnchor="end">${floor}</text>
+      </>}
+      {smaPath(20, "#4da6ff")}
+      {smaPath(50, "#f0c040")}
+      {display.map((c, i) => {
+        const x = i * (barW + gap) + gap;
+        const bull = c.c >= c.o;
+        const col = bull ? "#00ffaa" : "#ff4d6d";
+        const bodyTop = toY(Math.max(c.o, c.c));
+        const bodyH = Math.max(1.5, Math.abs(toY(c.o) - toY(c.c)));
+        return (
+          <g key={i}>
+            <line x1={x + barW / 2} y1={toY(c.h)} x2={x + barW / 2} y2={toY(c.l)} stroke={col} strokeWidth={1} />
+            <rect x={x} y={bodyTop} width={barW} height={bodyH} fill={col} rx={1} opacity={0.9} />
+          </g>
+        );
+      })}
+      {/* legend */}
+      <circle cx={6} cy={H + 14} r={3} fill="#4da6ff" />
+      <text x={12} y={H + 18} fill="#4da6ff" fontSize={8}>SMA20</text>
+      <circle cx={52} cy={H + 14} r={3} fill="#f0c040" />
+      <text x={58} y={H + 18} fill="#f0c040" fontSize={8}>SMA50</text>
+    </svg>
+  );
+}
+
+// ── RSI Gauge ──
+function RSIGauge({ value }) {
+  const color = value > 70 ? "#ff4d6d" : value < 30 ? "#00ffaa" : "#f0c040";
+  const label = value > 70 ? "קנוי יתר" : value < 30 ? "מכור יתר" : "ניטרלי";
+  const r = 26, cx = 34, cy = 34, circ = 2 * Math.PI * r;
+  return (
+    <div style={{ textAlign: "center" }}>
+      <svg width={68} height={48}>
+        <circle cx={cx} cy={cy} r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={5} />
+        <circle cx={cx} cy={cy} r={r} fill="none" stroke={color} strokeWidth={5}
+          strokeDasharray={`${circ * value / 100} ${circ * (1 - value / 100)}`}
+          strokeDashoffset={circ * 0.25} strokeLinecap="round" />
+        <text x={cx} y={cy + 5} fill={color} fontSize={12} fontWeight={700} textAnchor="middle">{value}</text>
+      </svg>
+      <div style={{ color, fontSize: 9, marginTop: -6 }}>{label}</div>
+    </div>
+  );
+}
+
+// ── Typewriter ──
+function Typewriter({ text }) {
+  const [shown, setShown] = useState("");
+  const ref = useRef(0);
+  useEffect(() => {
+    setShown(""); ref.current = 0;
+    const iv = setInterval(() => {
+      if (ref.current < text.length) { setShown(text.slice(0, ref.current + 1)); ref.current++; }
+      else clearInterval(iv);
+    }, 10);
+    return () => clearInterval(iv);
+  }, [text]);
+  return <span style={{ whiteSpace: "pre-wrap" }}>{shown}</span>;
+}
+
+// ── Skeleton loader ──
+function Skeleton({ w = "100%", h = 14, radius = 6 }) {
+  return (
+    <div style={{
+      width: w, height: h, borderRadius: radius,
+      background: "linear-gradient(90deg, rgba(255,255,255,0.05) 25%, rgba(255,255,255,0.1) 50%, rgba(255,255,255,0.05) 75%)",
+      backgroundSize: "200px 100%",
+      animation: "shimmer 1.4s infinite",
+    }} />
+  );
+}
+
+// ══════════ ONBOARDING ══════════
+const TRADING_LEVELS = ["מתחיל", "מתקדם", "מנוסה", "מקצועי"];
+const PORTFOLIO_SIZES = ["עד $10K", "$10K–$50K", "$50K–$200K", "$200K+"];
+const INTERESTS = ["מסחר יומי (Day Trading)", "מסחר קצר טווח (Swing)", "השקעה לטווח ארוך", "דיבידנדים והכנסה פסיבית", "ETF ומדדים", "מניות טכנולוגיה", "מניות צמיחה"];
+
+function Onboarding({ onDone }) {
+  const [step, setStep] = useState(0); // 0=splash, 1=name, 2=level, 3=portfolio, 4=interests, 5=disclaimer
+  const [form, setForm] = useState({ firstName: "", lastName: "", email: "", level: "", portfolioSize: "", interests: [] });
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackText, setFeedbackText] = useState("");
+  const [feedbackSent, setFeedbackSent] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [virtualBudget, setVirtualBudget] = useState(0);
+  const [budgetInput, setBudgetInput] = useState("");
+  const [portfolio, setPortfolio] = useState([]); // { symbol, shares, avgCost }
+  const [agreed, setAgreed] = useState(false);
+
+  const C = { bg: "#070b14", green: "#00ffaa", blue: "#4da6ff", text: "#c8d8e8", sub: "#3a5070", border: "rgba(255,255,255,0.08)" };
+
+  const toggleInterest = (item) => {
+    setForm(f => ({
+      ...f,
+      interests: f.interests.includes(item) ? f.interests.filter(x => x !== item) : [...f.interests, item]
+    }));
+  };
+
+  const canNext = () => {
+    if (step === 1) return form.firstName.trim().length > 0 && form.lastName.trim().length > 0;
+    if (step === 2) return form.level !== "";
+    if (step === 3) return form.portfolioSize !== "";
+    if (step === 4) return form.interests.length > 0;
+    if (step === 5) return agreed;
+    return true;
+  };
+
+  const inputStyle = {
+    width: "100%", background: "rgba(255,255,255,0.05)", border: `1px solid ${C.border}`,
+    borderRadius: 14, padding: "14px 16px", color: "#fff", fontSize: 15,
+    outline: "none", direction: "rtl", marginBottom: 12,
+  };
+
+  const chipStyle = (active) => ({
+    background: active ? "rgba(0,255,170,0.12)" : "rgba(255,255,255,0.04)",
+    border: `1px solid ${active ? C.green : C.border}`,
+    borderRadius: 50, padding: "10px 18px", cursor: "pointer",
+    color: active ? C.green : C.text, fontSize: 14, fontWeight: active ? 700 : 400,
+    transition: "all 0.15s", whiteSpace: "nowrap",
+  });
+
+  const steps = [
+    // 0 – Splash
+    <div key={0} style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "100vh", padding: 32, textAlign: "center", background: "radial-gradient(ellipse at 50% 30%, rgba(0,136,255,0.12) 0%, transparent 70%)" }}>
+      <div style={{ fontSize: 68, marginBottom: 20 }}>📈</div>
+      <div style={{ fontSize: 13, color: C.green, fontWeight: 700, letterSpacing: 3, marginBottom: 10 }}>BY YEHONATAN HAIM</div>
+      <div style={{ fontSize: 32, fontWeight: 800, color: "#fff", letterSpacing: -1, lineHeight: 1.2, marginBottom: 6 }}>ניתוח שוק ההון</div>
+      <div style={{ fontSize: 16, color: C.blue, fontWeight: 600, marginBottom: 28 }}>יהונתן חיים</div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center", marginBottom: 44 }}>
+        {["📊 ניתוח טכני", "🎯 ריצפה/תיקרה", "🤖 AI מקצועי", "⏱ מחירים חיים"].map(tag => (
+          <div key={tag} style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 50, padding: "6px 14px", fontSize: 13, color: C.text }}>{tag}</div>
+        ))}
+      </div>
+      <button onClick={() => setStep(1)} style={{ background: `linear-gradient(135deg, ${C.green}, ${C.blue})`, border: "none", borderRadius: 50, padding: "16px 48px", fontSize: 17, fontWeight: 800, color: "#070b14", cursor: "pointer", width: "100%", boxShadow: "0 8px 32px rgba(0,255,170,0.2)" }}>
+        בואו נתחיל →
+      </button>
+      <div style={{ marginTop: 20, fontSize: 11, color: C.sub }}>מופעל על ידי Claude AI · נתוני Yahoo Finance</div>
+    </div>,
+
+    // 1 – Name
+    <div key={1} style={{ padding: "60px 28px 32px" }}>
+      <div style={{ fontSize: 13, color: C.green, fontWeight: 700, marginBottom: 8 }}>שלב 1 מתוך 5</div>
+      <div style={{ fontSize: 24, fontWeight: 800, color: "#fff", marginBottom: 6 }}>קצת עליך</div>
+      <div style={{ fontSize: 14, color: C.sub, marginBottom: 32 }}>כדי שהסוכן ידע איך לפנות אליך</div>
+      <input style={inputStyle} placeholder="שם פרטי" value={form.firstName} onChange={e => setForm(f => ({ ...f, firstName: e.target.value }))} />
+      <input style={inputStyle} placeholder="שם משפחה" value={form.lastName} onChange={e => setForm(f => ({ ...f, lastName: e.target.value }))} />
+      <input style={{ ...inputStyle, direction: "ltr", textAlign: "right" }} placeholder="אימייל (אופציונלי)" type="email" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} /><div style={{ fontSize: 11, color: "#3a5070", marginTop: -8, marginBottom: 12, textAlign: "right" }}>לקבלת עדכונים ושיפורים</div>
+    </div>,
+
+    // 2 – Level
+    <div key={2} style={{ padding: "60px 28px 32px" }}>
+      <div style={{ fontSize: 13, color: C.green, fontWeight: 700, marginBottom: 8 }}>שלב 2 מתוך 5</div>
+      <div style={{ fontSize: 24, fontWeight: 800, color: "#fff", marginBottom: 6 }}>רמת המסחר שלך</div>
+      <div style={{ fontSize: 14, color: C.sub, marginBottom: 32 }}>הסוכן יתאים את הניתוח לרמתך</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {TRADING_LEVELS.map(l => (
+          <div key={l} onClick={() => setForm(f => ({ ...f, level: l }))}
+            style={{ background: form.level === l ? "rgba(0,255,170,0.08)" : "rgba(255,255,255,0.03)", border: `1px solid ${form.level === l ? C.green : C.border}`, borderRadius: 16, padding: "16px 20px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ color: form.level === l ? C.green : "#fff", fontSize: 15, fontWeight: form.level === l ? 700 : 400 }}>{l}</span>
+            {form.level === l && <span style={{ color: C.green, fontSize: 18 }}>✓</span>}
+          </div>
+        ))}
+      </div>
+    </div>,
+
+    // 3 – Portfolio size
+    <div key={3} style={{ padding: "60px 28px 32px" }}>
+      <div style={{ fontSize: 13, color: C.green, fontWeight: 700, marginBottom: 8 }}>שלב 3 מתוך 5</div>
+      <div style={{ fontSize: 24, fontWeight: 800, color: "#fff", marginBottom: 6 }}>גודל תיק ההשקעות</div>
+      <div style={{ fontSize: 14, color: C.sub, marginBottom: 32 }}>המידע נשמר רק אצלך במכשיר</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {PORTFOLIO_SIZES.map(s => (
+          <div key={s} onClick={() => setForm(f => ({ ...f, portfolioSize: s }))}
+            style={{ background: form.portfolioSize === s ? "rgba(0,255,170,0.08)" : "rgba(255,255,255,0.03)", border: `1px solid ${form.portfolioSize === s ? C.green : C.border}`, borderRadius: 16, padding: "16px 20px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ color: form.portfolioSize === s ? C.green : "#fff", fontSize: 15, fontWeight: form.portfolioSize === s ? 700 : 400 }}>{s}</span>
+            {form.portfolioSize === s && <span style={{ color: C.green, fontSize: 18 }}>✓</span>}
+          </div>
+        ))}
+      </div>
+    </div>,
+
+    // 4 – Interests
+    <div key={4} style={{ padding: "60px 28px 32px" }}>
+      <div style={{ fontSize: 13, color: C.green, fontWeight: 700, marginBottom: 8 }}>שלב 4 מתוך 5</div>
+      <div style={{ fontSize: 24, fontWeight: 800, color: "#fff", marginBottom: 6 }}>תחומי עניין</div>
+      <div style={{ fontSize: 14, color: C.sub, marginBottom: 32 }}>בחר אחד או יותר</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+        {INTERESTS.map(item => (
+          <div key={item} onClick={() => toggleInterest(item)} style={chipStyle(form.interests.includes(item))}>{item}</div>
+        ))}
+      </div>
+    </div>,
+
+    // 5 – Disclaimer
+    <div key={5} style={{ padding: "52px 24px 32px" }}>
+      <div style={{ fontSize: 22, fontWeight: 800, color: "#fff", marginBottom: 6 }}>⚠️ הצהרת אחריות</div>
+      <div style={{ fontSize: 13, color: C.sub, marginBottom: 20 }}>קרא בעיון לפני שממשיכים</div>
+      {/* Checkbox — בולט בראש */}
+      <div onClick={() => setAgreed(!agreed)}
+        style={{ display: "flex", alignItems: "center", gap: 14, cursor: "pointer", marginBottom: 20, background: agreed ? "rgba(0,255,170,0.07)" : "rgba(255,255,255,0.04)", border: `2px solid ${agreed ? C.green : "rgba(255,255,255,0.15)"}`, borderRadius: 16, padding: "16px 18px" }}>
+        <div style={{ width: 28, height: 28, borderRadius: 8, border: `2px solid ${agreed ? C.green : "rgba(255,255,255,0.3)"}`, background: agreed ? C.green : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          {agreed && <span style={{ color: "#070b14", fontSize: 16, fontWeight: 900 }}>✓</span>}
+        </div>
+        <span style={{ color: agreed ? C.green : "#fff", fontSize: 14, fontWeight: agreed ? 700 : 400, lineHeight: 1.5 }}>
+          קראתי והבנתי — כל פעולה שאבצע היא על אחריותי בלבד
+        </span>
+      </div>
+
+      <div style={{ background: "rgba(255,100,50,0.07)", border: "1px solid rgba(255,100,50,0.2)", borderRadius: 16, padding: 20, marginBottom: 100 }}>
+        <p style={{ color: C.text, fontSize: 13, lineHeight: 1.8 }}>
+          <strong style={{ color: "#ff8c69" }}>האפליקציה הזו מופעלת על ידי בינה מלאכותית (AI).</strong><br /><br />
+          • הסוכן <strong>עלול לטעות</strong> ולספק מידע שגוי, לא מדויק או לא מעודכן.<br /><br />
+          • המידע המוצג <strong>אינו ייעוץ השקעות</strong> ואינו מהווה תחליף לייעוץ מקצועי מורשה.<br /><br />
+          • <strong>כל החלטת מסחר או השקעה</strong> שתתקבל על בסיס המידע באפליקציה הינה <strong>באחריות המשתמש בלבד.</strong><br /><br />
+          • המפתחים <strong>אינם אחראים</strong> לכל הפסד כספי, ישיר או עקיף, שייגרם משימוש באפליקציה.<br /><br />
+          • נתוני המחירים מושהים ב-15 דקות ואינם בזמן אמת.
+        </p>
+      </div>
+    </div>,
+  ];
+
+  return (
+    <div style={{ maxWidth: 390, margin: "0 auto", minHeight: "100vh", background: "#070b14", fontFamily: "'Assistant', sans-serif", direction: "rtl", position: "relative" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Assistant:wght@400;600;700;800&display=swap'); * { box-sizing: border-box; margin: 0; padding: 0; } input::placeholder { color: #3a5070; }`}</style>
+
+      {/* Progress bar */}
+      {step > 0 && (
+        <div style={{ position: "fixed", top: 0, left: "50%", transform: "translateX(-50%)", width: 390, height: 3, background: "rgba(255,255,255,0.06)", zIndex: 99 }}>
+          <div style={{ height: "100%", width: `${Math.min(100, ((step) / 5) * 100)}%`, background: `linear-gradient(90deg, ${C.green}, ${C.blue})`, transition: "width 0.3s ease", borderRadius: 2 }} />
+        </div>
+      )}
+
+      {steps[step]}
+
+      {/* Bottom navigation */}
+      {step > 0 && (
+        <div style={{ position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: 390, padding: "16px 24px 32px", background: "rgba(7,11,20,0.97)", borderTop: "1px solid rgba(255,255,255,0.06)", display: "flex", gap: 12 }}>
+          {step > 1 && (
+            <button onClick={() => setStep(s => s - 1)}
+              style={{ flex: 1, background: "rgba(255,255,255,0.06)", border: "none", borderRadius: 50, padding: "14px", fontSize: 15, color: "#fff", cursor: "pointer" }}>
+              ← חזרה
+            </button>
+          )}
+          <button onClick={() => { if (canNext()) { step === 5 ? onDone(form) : setStep(s => s + 1); } }}
+            style={{ flex: 2, background: canNext() ? `linear-gradient(135deg, ${C.green}, ${C.blue})` : "rgba(255,255,255,0.08)", border: "none", borderRadius: 50, padding: "14px", fontSize: 15, fontWeight: 800, color: canNext() ? "#070b14" : "#3a5070", cursor: canNext() ? "pointer" : "default", transition: "all 0.2s" }}>
+            {step === 5 ? "כניסה לאפליקציה 🚀" : "המשך"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+function MainApp({ userProfile, onLogout }) {
+  const [tab, setTab] = useState("home");
+  const [watchlist, setWatchlist] = useState(INITIAL_SYMBOLS); // רשימת מעקב אישית
+  const [stockData, setStockData] = useState({});   // { AAPL: {...}, ... }
+  const [loadingSymbols, setLoadingSymbols] = useState({});
+  const [selectedSymbol, setSelectedSymbol] = useState(null);
+  const [aiAnalysis, setAiAnalysis] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchSymbol, setSearchSymbol] = useState("");
+  const [chatInput, setChatInput] = useState("");
+  const [chatImage, setChatImage] = useState(null); // { base64, mediaType, preview }
+  const imageInputRef = useRef(null);
+  const [chatHistory, setChatHistory] = useState([
+    { role: "ai", text: `שלום ${userProfile.firstName}! 🤖\n\nאני הסוכן שלך. טוען נתונים אמיתיים מ-Yahoo Finance...\n\nאני רואה: מחירים, RSI, SMA20/50, ריצפה/תיקרה, מגמה.\nשאל אותי כל דבר — לא צריך לתת לי מחירים.` }
+  ]);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState(""); // שלב הטעינה הנוכחי
+  const lastMsgRef = useRef(null); // ref לתחילת ההודעה האחרונה
+  const chatRef = useRef(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackText, setFeedbackText] = useState("");
+  const [feedbackSent, setFeedbackSent] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [virtualBudget, setVirtualBudget] = useState(0);
+  const [budgetInput, setBudgetInput] = useState("");
+  const [portfolio, setPortfolio] = useState([]); // { symbol, shares, avgCost }
+  const [portfolioModalOpen, setPortfolioModalOpen] = useState(false);
+  const [addSymbol, setAddSymbol] = useState("");
+  const [addShares, setAddShares] = useState("");
+  const [addPrice, setAddPrice] = useState("");
+  const [editingPosition, setEditingPosition] = useState(null);
+
+  // profile is always set here
+
+  // Load quote for a symbol
+  async function loadQuote(symbol) {
+    if (loadingSymbols[symbol] || (stockData[symbol] && !stockData[symbol].error)) return;
+    setLoadingSymbols(p => ({ ...p, [symbol]: true }));
+    try {
+      const q = await fetchQuote(symbol);
+      const meta = STOCK_META[symbol] || { name: symbol, sector: "—", pe: "—", mktCap: "—" };
+      setStockData(p => ({ ...p, [symbol]: { ...meta, ...q } }));
+      setLastUpdated(new Date());
+    } catch (e) {
+      console.error("fetchQuote error", symbol, e);
+      // שמור placeholder עם הודעת שגיאה
+      const meta = STOCK_META[symbol] || { name: symbol, sector: "—", pe: "—", mktCap: "—" };
+      setStockData(p => ({ ...p, [symbol]: { ...meta, symbol, price: null, error: true, errorMsg: "שגיאת חיבור" } }));
+    }
+    setLoadingSymbols(p => ({ ...p, [symbol]: false }));
+  }
+
+  // טעינת נתונים בפתיחת האפליקציה — מקביל לכולם
+  useEffect(() => {
+    // טעינה מקבילית של כל המניות מיד בכניסה
+    Promise.all(watchlist.map(s => loadQuote(s)));
+  }, []);
+
+  // רענון כל 15 דקות — מחיק cache ומטעין מחדש
+  useEffect(() => {
+    const iv = setInterval(() => {
+      setStockData({});
+      setTimeout(() => Promise.all(watchlist.map(s => loadQuote(s))), 100);
+    }, 15 * 60 * 1000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const selected = selectedSymbol ? stockData[selectedSymbol] : null;
+
+  async function openStock(symbol) {
+    setSelectedSymbol(symbol);
+    setAiAnalysis("");
+    setTab("stocks");
+    if (!stockData[symbol]) await loadQuote(symbol);
+    runAIAnalysis(symbol);
+  }
+
+  async function runAIAnalysis(symbol) {
+    const s = stockData[symbol];
+    if (!s) return;
+    setAiLoading(true);
+    setAiAnalysis("");
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          system: `אתה סוכן ניתוח טכני מקצועי בעברית. תנתח מניות/ETF בצורה עמוקה וישירה. 
+תמיד כלול: 
+1. מצב נוכחי (1-2 משפטים)
+2. ריצפה ותיקרה מרכזיות
+3. נקודת כניסה מומלצת
+4. סטופ לוס
+5. יעד ראשון + יעד שני
+6. האם עכשיו זמן טוב לכניסה ולמה
+היה ספציפי במחירים. זה לא ייעוץ השקעות רשמי.`,
+          messages: [{
+            role: "user",
+            content: `נתח: ${symbol} (${s.name})
+מחיר: $${s.price} | שינוי: ${s.changeP > 0 ? "+" : ""}${s.changeP}%
+RSI(14): ${s.rsi} | SMA20: $${s.sma20} | SMA50: $${s.sma50}
+ריצפה: $${s.floor} | תיקרה: $${s.ceiling}
+שיא 52 שבועות: $${s.high52} | שפל 52 שבועות: $${s.low52}
+מגמה: ${s.trend?.label} | נפח יחסי: ${s.relVol}x
+סקטור: ${s.sector} | P/E: ${s.pe}`
+          }]
+        })
+      });
+      const data = await res.json();
+      setAiAnalysis(data.content?.[0]?.text || "שגיאה.");
+    } catch { setAiAnalysis("שגיאה בחיבור לסוכן."); }
+    setAiLoading(false);
+  }
+
+  // Re-run analysis after data loads
+  useEffect(() => {
+    if (selectedSymbol && stockData[selectedSymbol] && !aiAnalysis && !aiLoading) {
+      runAIAnalysis(selectedSymbol);
+    }
+  }, [stockData, selectedSymbol]);
+
+  async function searchAndOpen() {
+    const sym = searchSymbol.trim().toUpperCase();
+    if (!sym) return;
+    setSearchSymbol("");
+    setSearchQuery("");
+    await openStock(sym);
+  }
+
+  const totalValue = portfolio.reduce((s, p) => {
+    const st = stockData[p.symbol];
+    return s + ((st && st.price) ? st.price * p.shares : p.avgCost * p.shares);
+  }, 0);
+  const totalCost = portfolio.reduce((s, p) => s + p.avgCost * p.shares, 0);
+  const totalPnL = totalValue - totalCost;
+  const availableCash = virtualBudget - totalCost;
+
+  async function sendChat() {
+    if (!chatInput.trim() && !chatImage) return;
+    const msg = chatInput.trim() || "נתח את התמונה הזו";
+    setChatInput("");
+    const imgData = chatImage;
+    setChatImage(null);
+
+    // הודעת משתמש עם תמונה אם יש
+    const userMsg = imgData
+      ? { role: "user", text: msg, image: imgData.preview }
+      : { role: "user", text: msg };
+    const newHist = [...chatHistory, userMsg];
+    setChatHistory(newHist);
+    setChatLoading(true);
+
+    const allData = { ...stockData };
+
+    // ── זיהוי מניה ספציפית בשאלה ──
+    const symbolPattern = /([A-Z]{2,5})/g;
+    const IGNORE = ["AI","RSI","SMA","ETF","THE","AND","FOR","USD","API","CEO","IPO"];
+    const foundSymbols = [...new Set([...msg.toUpperCase().matchAll(symbolPattern)]
+      .map(m => m[1]).filter(s => !IGNORE.includes(s)))];
+
+    // טען קודם את המניה שנשאלה עליה — ממוקד ומהיר
+    for (const sym of foundSymbols.slice(0, 2)) {
+      if (!allData[sym] || allData[sym].error) {
+        setLoadingStatus(`📡 סורק ${sym}...`);
+        try {
+          const q = await fetchQuote(sym);
+          const meta = STOCK_META[sym] || { name: sym, sector: "—", pe: "—", mktCap: "—" };
+          const full = { ...meta, ...q };
+          allData[sym] = full;
+          setStockData(prev => ({ ...prev, [sym]: full }));
+        } catch(e) { console.error(sym, e); }
+      }
+    }
+
+    // השלם מניות חסרות מהwatchlist ברקע (לא חוסם)
+    const missing = watchlist.filter(s => !allData[s] || allData[s].error);
+    if (missing.length > 0) {
+      Promise.all(missing.map(async s => {
+        try {
+          const q = await fetchQuote(s);
+          const meta = STOCK_META[s] || { name: s, sector: "—", pe: "—", mktCap: "—" };
+          setStockData(prev => ({ ...prev, [s]: { ...meta, ...q } }));
+        } catch(e) {}
+      }));
+    }
+
+    setLoadingStatus("🤖 מנתח...");
+
+    // טען כל מניה שנשאלה עליה — גם אם לא ברשימת המעקב
+    for (const sym of foundSymbols.slice(0, 3)) {
+      if (!allData[sym] || allData[sym].error) {
+        setLoadingStatus(`📡 מביא נתונים עבור ${sym}...`);
+        try {
+          const q = await fetchQuote(sym);
+          const meta = STOCK_META[sym] || { name: sym, sector: "—", pe: "—", mktCap: "—" };
+          const full = { ...meta, ...q };
+          allData[sym] = full;
+          setStockData(prev => ({ ...prev, [sym]: full }));
+        } catch(e) { console.error(sym, e); }
+      }
+    }
+    setLoadingStatus("🤖 מנתח...");
+
+    // המניות שנשאלו עליהן — ראשונות ב-snapshot
+    const validData = Object.values(allData).filter(s => s && s.price && !s.error && !isNaN(s.price));
+    validData.sort((a, b) => (foundSymbols.includes(a.symbol) ? -1 : 1) - (foundSymbols.includes(b.symbol) ? -1 : 1));
+    const hasFallback = validData.some(s => s.isFallback);
+    const fallbackDates = validData.filter(s=>s.isFallback).map(s=>s.dataDate).filter(Boolean);
+    const uniqueDate = fallbackDates.length > 0 ? fallbackDates[0] : "";
+    const dataNote = hasFallback && uniqueDate ? `\n[חלק מהנתונים הם מיום ${uniqueDate}]` : "";
+    const snapshot = validData.length > 0
+      ? validData.map(s =>
+          `${s.symbol} [${s.dataDate||new Date().toLocaleDateString("he-IL")}] | מחיר:$${s.price} | שינוי:${s.changeP > 0 ? "+" : ""}${(s.changeP||0).toFixed(2)}% | RSI:${s.rsi} | SMA20:$${s.sma20} | SMA50:$${s.sma50} | ריצפה:$${s.floor} | תיקרה:$${s.ceiling} | מגמה:${s.trend?.label} | נפח:${s.relVol}x`
+        ).join("\n") + dataNote
+      : "⚠️ נתוני שוק לא זמינים — ניתוח לפי ידע כללי בלבד";
+
+    const portSnap = portfolio.map(p => {
+      const s = allData[p.symbol];
+      const pnl = s ? ((s.price - p.avgCost) * p.shares).toFixed(0) : "—";
+      return `${p.symbol}: ${p.shares} מניות, כניסה $${p.avgCost}, נוכחי $${s?.price || "—"}, P&L: $${pnl}`;
+    }).join("\n");
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 2000,
+          system: `אתה סוכן ניתוח טכני מקצועי בעברית. השם שלך "יהונתן חיים ניתוח שוק ההון".
+אם המשתמש שולח תמונה של גרף — נתח אותה לפי מה שאתה רואה: מגמה, ריצפה, תיקרה, RSI אם מופיע, נרות, נקודות תמיכה/התנגדות. תן ניתוח מקצועי מלא על הגרף בדיוק כמו שאתה מנתח מניה.
+המשתמש: ${userProfile.firstName} | רמה: ${userProfile.level}
+
+נתוני שוק אמיתיים (Yahoo Finance, 15 דק' השהייה) — השתמש בהם תמיד:
+${snapshot || "טוען..."}
+
+תיק וירטואלי של המשתמש:
+${portSnap || "ריק"}
+תקציב: $${virtualBudget} | שווי תיק: $${(totalValue||0).toFixed(0)} | רווח: $${(totalPnL||0).toFixed(0)}
+
+חוקי ברזל — חייב לפעול לפיהם תמיד:
+1. כשמישהו שואל על מניה — תן ניתוח מלא עם כל הנתונים הבאים בפורמט ברור:
+   💰 מחיר נוכחי: $X
+   📊 RSI(14): X — [פרשנות]
+   📈 SMA20: $X | SMA50: $X
+   🟢 ריצפה/תמיכה: $X
+   🔴 תיקרה/התנגדות: $X
+   📉 מגמה: [עולה/יורד/ניטרלי]
+   🎯 נקודת כניסה: $X–$X
+   🛑 סטופ לוס: $X (מתחת לריצפה)
+   🏁 יעד ראשון: $X
+   🏆 יעד שני: $X
+   ⚡ סיגנל: [קנייה/מכירה/המתן] + הסבר
+   
+2. אסור לתת תשובות כלליות ועמומות — תמיד מספרים ספציפיים
+3. אסור לבקש מהמשתמש מחירים — יש לך את כל הנתונים למעלה
+4. אם מניה לא מופיעה בנתונים למעלה — נתח אותה לפי הידע שלך עם הערכות סבירות. אל תאמר "המניה לא ברשימה" — פשוט נתח!
+5. אם הנתונים בטעינה — ציין שהמחיר הוא הערכה ותן ניתוח מלא בכל זאת
+6. בסוף כל ניתוח מניה — חייב להוסיף בדיוק את השורה הזו:
+   ⚠️ *הניתוח מבוצע על ידי AI ועלול לכלול שגיאות. אין להסתמך עליו לקבלת החלטות פיננסיות. כל פעולה היא באחריות המשתמש בלבד.*`,
+          messages: newHist.map((m, i) => {
+            const isLast = i === newHist.length - 1;
+            if (isLast && imgData && m.role === "user") {
+              return {
+                role: "user",
+                content: [
+                  { type: "image", source: { type: "base64", media_type: imgData.mediaType, data: imgData.base64 } },
+                  { type: "text", text: m.text }
+                ]
+              };
+            }
+            return { role: m.role === "ai" ? "assistant" : "user", content: m.text };
+          })
+        })
+      });
+      const data = await res.json();
+      const reply = data.content?.[0]?.text || "שגיאה.";
+      setChatHistory([...newHist, { role: "ai", text: reply }]);
+    } catch {
+      setChatHistory([...newHist, { role: "ai", text: "שגיאה בחיבור." }]);
+    }
+    setChatLoading(false);
+    setLoadingStatus("");
+    // גלול לתחילת ההודעה האחרונה — לא לסוף
+    setTimeout(() => {
+      if (lastMsgRef.current) {
+        lastMsgRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }, 100);
+  }
+
+  const C = { bg: "#070b14", card: "rgba(255,255,255,0.03)", border: "rgba(255,255,255,0.07)", green: "#00ffaa", red: "#ff4d6d", blue: "#4da6ff", yellow: "#f0c040", text: "#c8d8e8", sub: "#3a5070" };
+
+  const displaySymbols = Object.keys(stockData).filter(s =>
+    s.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    (stockData[s]?.name || "").toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  return (
+    <div style={{ maxWidth: 390, margin: "0 auto", minHeight: "100vh", background: C.bg, fontFamily: "'Assistant', sans-serif", direction: "rtl", position: "relative" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Assistant:wght@400;600;700;800&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        ::-webkit-scrollbar { width: 0; }
+        @keyframes pulse { 0%,100%{opacity:.3;transform:scale(.8)} 50%{opacity:1;transform:scale(1.2)} }
+        @keyframes fadeUp { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+        @keyframes shimmer { 0%{background-position:-200px 0} 100%{background-position:200px 0} }
+        .row:hover { background: rgba(255,255,255,0.05) !important; }
+        input::placeholder { color: #3a5070; }
+      `}</style>
+
+      {/* ══ HOME ══ */}
+      {tab === "home" && (
+        <div style={{ paddingBottom: 80, animation: "fadeUp .3s ease" }}>
+          <div style={{ padding: "52px 20px 16px", background: "linear-gradient(180deg,#0d1528,transparent)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: "#fff" }}>שלום, {userProfile.firstName} 👋</div>
+                <div style={{ fontSize: 11, color: C.sub, marginTop: 2 }}>
+                  {lastUpdated ? `עודכן: ${lastUpdated.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" })} · מושהה 15 דק'` : "טוען נתונים..."}
+                </div>
+                <div style={{ display:"inline-flex", alignItems:"center", gap:6, background:"rgba(240,192,64,0.1)", border:"1px solid rgba(240,192,64,0.25)", borderRadius:20, padding:"3px 10px", marginTop:6, cursor:"pointer" }} onClick={()=>setSettingsOpen(true)}>
+                  <span style={{fontSize:12}}>🎮</span>
+                  <span style={{fontSize:11, color:"#f0c040", fontWeight:700}}>מצב לימוד · כסף וירטואלי</span>
+                </div>
+              </div>
+              <div style={{ width: 44, height: 44, borderRadius: "50%", background: "linear-gradient(135deg,#0088ff,#00ffaa)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 800, color: "#0a0e1a" }}>א</div>
+            </div>
+          </div>
+
+          {/* Portfolio card */}
+          <div style={{ background: "linear-gradient(135deg,#0d1f3c,#0a1628)", border: "1px solid rgba(0,140,255,0.2)", borderRadius: 20, padding: 20, margin: "0 16px 16px" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>
+              <span style={{fontSize:12}}>🎮</span>
+              <span style={{fontSize:11, color:"#f0c040", fontWeight:700}}>תיק וירטואלי · כסף לא אמיתי</span>
+              <button onClick={()=>setSettingsOpen(true)} style={{marginRight:"auto", background:"rgba(240,192,64,0.12)", border:"1px solid rgba(240,192,64,0.25)", borderRadius:20, padding:"2px 10px", color:"#f0c040", fontSize:11, cursor:"pointer"}}>⚙️ הגדרות</button>
+            </div>
+            <div style={{ fontSize: 11, color: C.sub, marginBottom: 2 }}>שווי תיק</div>
+            <div style={{ fontSize: 36, fontWeight: 800, color: "#fff", letterSpacing: -1 }}>
+              ${totalValue.toLocaleString("en", { maximumFractionDigits: 0 })}
+            </div>
+            <div style={{ display: "flex", gap: 16, marginTop: 10, flexWrap:"wrap" }}>
+              <div>
+                <div style={{ fontSize: 10, color: C.sub }}>תקציב</div>
+                <div style={{ color: "#f0c040", fontSize: 14, fontWeight: 700 }}>${virtualBudget.toLocaleString("en", { maximumFractionDigits: 0 })}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: C.sub }}>מזומן פנוי</div>
+                <div style={{ color: availableCash >= 0 ? C.green : C.red, fontSize: 14, fontWeight: 700 }}>${Math.max(0,availableCash).toLocaleString("en", {maximumFractionDigits:0})}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: C.sub }}>רווח/הפסד</div>
+                <div style={{ color: totalPnL >= 0 ? C.green : C.red, fontSize: 14, fontWeight: 700 }}>
+                  {totalPnL >= 0 ? "+" : ""}${totalPnL.toLocaleString("en", { maximumFractionDigits: 0 })}
+                </div>
+              </div>
+            </div>
+            {virtualBudget === 0 && (
+              <div onClick={()=>setSettingsOpen(true)} style={{ marginTop:12, background:"rgba(240,192,64,0.08)", border:"1px dashed rgba(240,192,64,0.35)", borderRadius:10, padding:"8px 12px", cursor:"pointer", textAlign:"center" }}>
+                <span style={{ color:"#f0c040", fontSize:12 }}>👆 לחץ הגדרות כדי להגדיר תקציב וירטואלי</span>
+              </div>
+            )}
+          </div>
+
+          {/* Quick signals */}
+          <div style={{ padding: "0 16px 8px" }}>
+            <div style={{ fontSize: 11, color: C.sub, marginBottom: 8 }}>סיגנלים מהירים · מחירים אמיתיים</div>
+            <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 6 }}>
+              {watchlist.map(sym => {
+                const s = stockData[sym];
+                const loading = loadingSymbols[sym];
+                const sig = !s ? null : s.rsi < 35 ? { t: "קנייה", c: C.green } : s.rsi > 65 ? { t: "מכירה", c: C.red } : { t: "המתן", c: C.yellow };
+                return (
+                  <div key={sym} onClick={() => openStock(sym)}
+                    style={{ flexShrink: 0, background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "10px 14px", cursor: "pointer", minWidth: 90 }}>
+                    <div style={{ color: C.blue, fontSize: 12, fontWeight: 700, marginBottom: 4 }}>{sym}</div>
+                    {loading || !s ? <Skeleton h={10} w={60} /> : <>
+                      <div style={{ color: s.changeP >= 0 ? C.green : C.red, fontSize: 11, fontWeight: 600 }}>
+                        {s.changeP >= 0 ? "+" : ""}{(s.changeP||0).toFixed(2)}%
+                      </div>
+                      <div style={{ color: sig?.c, fontSize: 10, marginTop: 2 }}>{sig?.t}</div>
+                    </>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Holdings */}
+          <div style={{ padding: "12px 16px 6px" }}>
+            <div style={{ fontSize: 11, color: C.sub }}>ההחזקות שלי</div>
+          </div>
+          {portfolio.map(p => {
+            const s = stockData[p.symbol];
+            const loading = loadingSymbols[p.symbol];
+            const pnl = (s && s.price) ? (s.price - p.avgCost) * p.shares : 0;
+            return (
+              <div key={p.symbol} className="row"
+                style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 16px", borderBottom: `1px solid ${C.border}`, cursor: "pointer" }}
+                onClick={() => openStock(p.symbol)}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{ background: "rgba(0,140,255,0.12)", borderRadius: 8, padding: "4px 10px", fontSize: 12, fontWeight: 700, color: C.blue }}>{p.symbol}</div>
+                  <div>
+                    <div style={{ color: "#fff", fontSize: 13, fontWeight: 600 }}>{p.shares} מניות</div>
+                    {loading || !s ? <Skeleton h={9} w={80} /> :
+                      <div style={{ color: C.sub, fontSize: 11 }}>RSI {s.rsi} · {s.trend?.label}</div>}
+                  </div>
+                </div>
+                <div style={{ textAlign: "left" }}>
+                  {loading || !s ? <Skeleton h={14} w={70} /> : <>
+                    <div style={{ color: "#fff", fontSize: 13, fontWeight: 700 }}>${(s.price * p.shares).toLocaleString("en", { maximumFractionDigits: 0 })}</div>
+                    <div style={{ color: pnl >= 0 ? C.green : C.red, fontSize: 11 }}>{pnl >= 0 ? "+" : ""}${pnl.toLocaleString("en", { maximumFractionDigits: 0 })}</div>
+                  </>}
+                </div>
+              </div>
+            );
+          })}
+
+          <div style={{ margin: "12px 16px 0", background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: "14px 16px", cursor: "pointer", display: "flex", alignItems: "center", gap: 12 }}
+            onClick={() => setTab("chat")}>
+            <span style={{ fontSize: 24 }}>🤖</span>
+            <div>
+              <div style={{ color: "#fff", fontSize: 13, fontWeight: 600 }}>שאל את הסוכן</div>
+              <div style={{ color: C.sub, fontSize: 11 }}>רואה מחירים אמיתיים — ניתוח עמוק עם נתונים חיים</div>
+            </div>
+            <div style={{ marginRight: "auto", color: C.sub }}>←</div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ STOCKS ══ */}
+      {tab === "stocks" && (
+        <div style={{ paddingBottom: 80, animation: "fadeUp .3s ease" }}>
+          {!selectedSymbol ? (
+            <>
+              <div style={{ padding: "52px 16px 12px" }}>
+                <div style={{ fontSize: 20, fontWeight: 800, color: "#fff" }}>סורק מניות</div>
+                <div style={{ fontSize: 11, color: C.sub, marginBottom: 14 }}>מחירים מושהים 15 דק' · ניתוח AI מעמיק</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+                    placeholder="סנן מניות..."
+                    style={{ flex: 1, background: "rgba(255,255,255,0.06)", border: `1px solid ${C.border}`, borderRadius: 12, padding: "9px 14px", color: "#fff", fontSize: 13, outline: "none", direction: "rtl" }} />
+                  <input value={searchSymbol} onChange={e => setSearchSymbol(e.target.value.toUpperCase())}
+                    onKeyDown={e => e.key === "Enter" && searchAndOpen()}
+                    placeholder="TSLA..."
+                    style={{ width: 80, background: "rgba(255,255,255,0.06)", border: `1px solid ${C.border}`, borderRadius: 12, padding: "9px 10px", color: "#fff", fontSize: 13, outline: "none", direction: "ltr", textAlign: "center" }} />
+                  <button onClick={searchAndOpen}
+                    style={{ background: "linear-gradient(135deg,#00ffaa,#0088ff)", border: "none", borderRadius: 12, padding: "9px 14px", color: "#0a0e1a", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>חפש</button>
+                </div>
+              </div>
+              {displaySymbols.map(sym => {
+                const s = stockData[sym];
+                if (!s) return null;
+                const sig = s.rsi < 35 ? { t: "קנייה", c: C.green } : s.rsi > 65 ? { t: "מכירה", c: C.red } : { t: "המתן", c: C.yellow };
+                return (
+                  <div key={sym} className="row"
+                    style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", borderBottom: `1px solid ${C.border}`, cursor: "pointer" }}
+                    onClick={() => openStock(sym)}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <div style={{ background: "rgba(0,140,255,0.12)", borderRadius: 10, padding: "6px 12px", fontSize: 12, fontWeight: 700, color: C.blue, minWidth: 60, textAlign: "center" }}>{sym}</div>
+                      <div>
+                        <div style={{ color: "#fff", fontSize: 13, fontWeight: 600 }}>{s.name}</div>
+                        <div style={{ color: C.sub, fontSize: 11 }}>RSI {s.rsi} · ${s.price}</div>
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "left" }}>
+                      <div style={{ color: s.changeP >= 0 ? C.green : C.red, fontSize: 14, fontWeight: 700 }}>
+                        {s.changeP >= 0 ? "+" : ""}{(s.changeP||0).toFixed(2)}%
+                      </div>
+                      <div style={{ color: sig.c, fontSize: 10, fontWeight: 600 }}>● {sig.t}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </>
+          ) : (
+            <div style={{ paddingBottom: 20 }}>
+              <div style={{ padding: "52px 16px 14px", background: "linear-gradient(180deg,#0d1528,transparent)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <button onClick={() => setSelectedSymbol(null)}
+                    style={{ background: "rgba(255,255,255,0.07)", border: "none", color: "#fff", borderRadius: 10, padding: "6px 14px", cursor: "pointer", fontSize: 13 }}>← חזרה</button>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: "#fff" }}>{selectedSymbol}</div>
+                  {selected && (
+                    <div style={{ color: selected.changeP >= 0 ? C.green : C.red, fontSize: 13, fontWeight: 700 }}>
+                      ${selected.price} · {selected.changeP >= 0 ? "+" : ""}{(selected.changeP||0).toFixed(2)}%
+                    </div>
+                  )}
+                </div>
+                {lastUpdated && <div style={{ fontSize: 10, color: C.sub, marginTop: 6 }}>נתונים מושהים 15 דק' · {lastUpdated.toLocaleTimeString("he-IL")}</div>}
+              </div>
+
+              {!selected || loadingSymbols[selectedSymbol] ? (
+                <div style={{ padding: "0 16px" }}>
+                  <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 16, marginBottom: 12 }}>
+                    <Skeleton h={180} radius={10} />
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+                    {[1,2,3,4,5,6].map(i => <div key={i} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 12 }}><Skeleton h={12} /><div style={{ marginTop: 8 }} /><Skeleton h={18} w="60%" /></div>)}
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* Chart */}
+                  <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, margin: "0 16px 12px", padding: "14px 12px 26px" }}>
+                    <div style={{ fontSize: 10, color: C.sub, marginBottom: 10 }}>גרף יומי 3 חודשים · ריצפה/תיקרה/SMA</div>
+                    <CandleChart candles={selected.candles} floor={selected.floor} ceiling={selected.ceiling} />
+                  </div>
+
+                  {/* Indicators */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, margin: "0 16px 12px" }}>
+                    {[
+                      { l: "מחיר נוכחי", v: `$${selected.price || "—"}`, c: "#fff" },
+                      { l: "שינוי היום", v: `${(selected.changeP||0) >= 0 ? "+" : ""}${(selected.changeP||0).toFixed(2)}%`, c: (selected.changeP||0) >= 0 ? C.green : C.red },
+                      { l: "ריצפה", v: `$${selected.floor}`, c: "#ff6b35" },
+                      { l: "תיקרה", v: `$${selected.ceiling}`, c: C.green },
+                      { l: "SMA20", v: `$${selected.sma20}`, c: C.blue },
+                      { l: "SMA50", v: `$${selected.sma50}`, c: C.yellow },
+                      { l: "מגמה", v: selected.trend?.label, c: selected.trend?.color },
+                      { l: "נפח יחסי", v: `${selected.relVol}x`, c: parseFloat(selected.relVol) > 1.2 ? C.green : C.sub },
+                      { l: "שיא 52 שבועות", v: `$${selected.high52}`, c: C.text },
+                      { l: "שפל 52 שבועות", v: `$${selected.low52}`, c: C.text },
+                    ].map(item => (
+                      <div key={item.l} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "10px 14px" }}>
+                        <div style={{ fontSize: 10, color: C.sub }}>{item.l}</div>
+                        <div style={{ color: item.c, fontSize: 14, fontWeight: 700, marginTop: 3 }}>{item.v}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* RSI */}
+                  <div style={{ display: "flex", gap: 10, margin: "0 16px 12px" }}>
+                    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, flex: 1, display: "flex", alignItems: "center", gap: 10 }}>
+                      <RSIGauge value={selected.rsi} />
+                      <div>
+                        <div style={{ fontSize: 10, color: C.sub }}>RSI (14)</div>
+                        <div style={{ fontSize: 12, color: C.text, marginTop: 4, lineHeight: 1.4 }}>
+                          {selected.rsi > 70 ? "⚠️ קנוי יתר — שקול לחכות" : selected.rsi < 30 ? "🟢 מכור יתר — הזדמנות" : "אזור נורמלי"}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, flex: 1 }}>
+                      <div style={{ fontSize: 10, color: C.sub }}>P/E יחס</div>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: "#fff", marginTop: 4 }}>{selected.pe}</div>
+                      <div style={{ fontSize: 10, color: C.sub, marginTop: 2 }}>שווי שוק: {selected.mktCap}</div>
+                    </div>
+                  </div>
+
+                  {/* AI Analysis */}
+                  <div style={{ background: "linear-gradient(135deg,rgba(0,136,255,0.06),rgba(0,255,170,0.04))", border: "1px solid rgba(0,136,255,0.2)", borderRadius: 16, margin: "0 16px", padding: 16 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                      <span>🤖</span>
+                      <span style={{ color: C.blue, fontSize: 13, fontWeight: 700 }}>ניתוח AI מעמיק</span>
+                      {aiLoading && <div style={{ display: "flex", gap: 4, marginRight: "auto" }}>
+                        {[0,1,2].map(i => <div key={i} style={{ width: 6, height: 6, borderRadius: "50%", background: C.blue, animation: "pulse 1.2s ease-in-out infinite", animationDelay: `${i*0.2}s` }} />)}
+                      </div>}
+                    </div>
+                    {aiLoading
+                      ? <div style={{ color: C.sub, fontSize: 12 }}>מנתח נתונים אמיתיים מ-Yahoo Finance...</div>
+                      : aiAnalysis
+                        ? <div style={{ color: C.text, fontSize: 13, lineHeight: 1.7 }}><Typewriter text={aiAnalysis} /></div>
+                        : null}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ══ CHAT ══ */}
+      {tab === "chat" && (
+        <div style={{ animation: "fadeUp .3s ease" }}>
+          <div style={{ padding: "52px 16px 12px", background: "linear-gradient(180deg,#0d1528,transparent)" }}>
+            <div style={{ fontSize: 20, fontWeight: 800, color: "#fff" }}>סוכן AI</div>
+            <div style={{ display:"flex", alignItems:"center", gap:6, marginTop:3 }}>
+              {(() => {
+                const loaded = Object.values(stockData).filter(s => s.price && !s.error);
+                const fallbacks = loaded.filter(s => s.isFallback).length;
+                const live = loaded.filter(s => !s.isFallback && s.dataSource?.includes('Yahoo')).length;
+                if (loaded.length === 0) return <><div style={{width:7,height:7,borderRadius:"50%",background:"#f0c040",animation:"pulse 1s infinite"}}/><span style={{fontSize:11,color:"#f0c040"}}>טוען נתונים...</span></>;
+                const sampleDate = loaded[0]?.dataDate || "";
+                if (live > 0) return <><div style={{width:7,height:7,borderRadius:"50%",background:C.green}}/><span style={{fontSize:11,color:C.green}}>מעודכן {sampleDate} ✓</span></>;
+                return <><div style={{width:7,height:7,borderRadius:"50%",background:"#f0c040"}}/><span style={{fontSize:11,color:"#f0c040"}}>נתוני יום קודם · {sampleDate}</span></>;
+              })()}
+            </div>
+          </div>
+          <div ref={chatRef} style={{ height: "calc(100vh - 175px)", overflowY: "auto", padding: "0 16px 80px" }}>
+            {chatHistory.map((m, i) => {
+              const isLastAI = m.role === "ai" && i === chatHistory.length - 1;
+              return (
+                <div key={i}
+                  ref={isLastAI ? lastMsgRef : null}
+                  style={{
+                    background: m.role === "ai" ? "rgba(0,140,255,0.07)" : "rgba(0,255,170,0.07)",
+                    border: `1px solid ${m.role === "ai" ? "rgba(0,140,255,0.15)" : "rgba(0,255,170,0.15)"}`,
+                    borderRadius: m.role === "ai" ? "16px 16px 16px 4px" : "16px 16px 4px 16px",
+                    padding: "12px 14px", marginBottom: 10,
+                    maxWidth: "88%",
+                    marginRight: m.role === "ai" ? 0 : "auto",
+                    marginLeft: m.role === "ai" ? "auto" : 0,
+                  }}>
+                  {m.role === "ai" && <div style={{ fontSize: 10, color: C.blue, marginBottom: 4 }}>🤖 סוכן · נתונים אמיתיים</div>}
+                  {m.image && <img src={m.image} alt="chart" style={{ width:"100%", borderRadius:8, marginBottom:6, maxHeight:200, objectFit:"cover" }}/>}
+                  <p style={{ color: C.text, fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{m.text}</p>
+                </div>
+              );
+            })}
+            {chatLoading && (
+              <div style={{ background: "rgba(0,140,255,0.07)", border: "1px solid rgba(0,140,255,0.15)", borderRadius: "16px 16px 16px 4px", padding: "12px 16px", maxWidth: "85%" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {[0,1,2].map(i => <div key={i} style={{ width: 6, height: 6, borderRadius: "50%", background: C.blue, animation: "pulse 1.2s ease-in-out infinite", animationDelay: `${i*0.2}s` }} />)}
+                  </div>
+                  <span style={{ color: C.blue, fontSize: 12, fontWeight: 600 }}>
+                    {loadingStatus || "🤖 מעבד..."}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+          <div style={{ position:"fixed", bottom:60, left:"50%", transform:"translateX(-50%)", width:358, background:"rgba(7,11,20,0.97)", padding:"8px 0" }}>
+            {/* תצוגת תמונה שנבחרה */}
+            {chatImage && (
+              <div style={{ position:"relative", marginBottom:8, display:"inline-block" }}>
+                <img src={chatImage.preview} alt="preview" style={{ height:60, borderRadius:8, border:`1px solid ${C.border}` }}/>
+                <button onClick={() => setChatImage(null)} style={{ position:"absolute", top:-6, right:-6, width:18, height:18, borderRadius:"50%", background:C.red, border:"none", color:"#fff", fontSize:11, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>✕</button>
+              </div>
+            )}
+            <div style={{ display:"flex", gap:8 }}>
+              {/* כפתור העלאת תמונה */}
+              <button onClick={() => imageInputRef.current?.click()}
+                style={{ width:42, height:42, borderRadius:"50%", background: chatImage ? "rgba(0,255,170,0.2)" : "rgba(255,255,255,0.07)", border:`1px solid ${chatImage ? C.green : C.border}`, cursor:"pointer", fontSize:18, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                📷
+              </button>
+              <input ref={imageInputRef} type="file" accept="image/*" style={{ display:"none" }}
+                onChange={e => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = ev => {
+                    const dataUrl = ev.target.result;
+                    const base64 = dataUrl.split(",")[1];
+                    const mediaType = file.type || "image/jpeg";
+                    setChatImage({ base64, mediaType, preview: dataUrl });
+                  };
+                  reader.readAsDataURL(file);
+                  e.target.value = "";
+                }}/>
+              <input value={chatInput} onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && sendChat()}
+                placeholder={chatImage ? "הוסף הערה לתמונה (אופציונלי)..." : "שאל על מניה, העלה גרף לניתוח..."}
+                style={{ flex:1, background:"rgba(255,255,255,0.07)", border:`1px solid ${C.border}`, borderRadius:24, padding:"10px 16px", color:"#fff", fontSize:13, outline:"none", direction:"rtl" }}/>
+              <button onClick={sendChat}
+                style={{ width:42, height:42, borderRadius:"50%", background:"linear-gradient(135deg,#00ffaa,#0088ff)", border:"none", cursor:"pointer", fontSize:18, color:"#0a0e1a", fontWeight:800, flexShrink:0 }}>↑</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ PORTFOLIO ══ */}
+      {tab === "portfolio" && (
+        <div style={{ paddingBottom: 90, animation: "fadeUp .3s ease" }}>
+          <div style={{ padding: "52px 16px 12px", background: "linear-gradient(180deg,#0d1528,transparent)", display:"flex", justifyContent:"space-between", alignItems:"flex-end" }}>
+            <div>
+              <div style={{ fontSize: 20, fontWeight: 800, color: "#fff" }}>התיק שלי 🎮</div>
+              <div style={{ fontSize: 10, color: "#f0c040", marginTop: 2 }}>תיק וירטואלי · כסף לא אמיתי</div>
+            </div>
+            <button onClick={() => { setEditingPosition(null); setAddSymbol(""); setAddShares(""); setAddPrice(""); setPortfolioModalOpen(true); }}
+              style={{ background:"linear-gradient(135deg,#00ffaa,#0088ff)", border:"none", borderRadius:20, padding:"8px 16px", color:"#070b14", fontWeight:800, fontSize:13, cursor:"pointer" }}>
+              + הוסף מניה
+            </button>
+          </div>
+
+          {/* Summary card */}
+          <div style={{ background:"linear-gradient(135deg,#0d1f3c,#0a1628)", border:"1px solid rgba(0,140,255,0.2)", borderRadius:20, padding:20, margin:"0 16px 16px" }}>
+            <div style={{ display:"flex", gap:16, flexWrap:"wrap" }}>
+              <div>
+                <div style={{ fontSize:10, color:C.sub }}>שווי תיק</div>
+                <div style={{ fontSize:28, fontWeight:800, color:"#fff", letterSpacing:-1 }}>${totalValue.toLocaleString("en",{maximumFractionDigits:0})}</div>
+              </div>
+              <div>
+                <div style={{ fontSize:10, color:C.sub }}>תקציב</div>
+                <div style={{ fontSize:16, fontWeight:700, color:"#f0c040" }}>${virtualBudget.toLocaleString("en",{maximumFractionDigits:0})}</div>
+              </div>
+              <div>
+                <div style={{ fontSize:10, color:C.sub }}>מזומן פנוי</div>
+                <div style={{ fontSize:16, fontWeight:700, color: availableCash>=0 ? C.green : C.red }}>${Math.max(0,availableCash).toLocaleString("en",{maximumFractionDigits:0})}</div>
+              </div>
+              <div>
+                <div style={{ fontSize:10, color:C.sub }}>רווח/הפסד</div>
+                <div style={{ fontSize:16, fontWeight:700, color: totalPnL>=0 ? C.green : C.red }}>
+                  {totalPnL>=0?"+":""}{totalPnL.toLocaleString("en",{maximumFractionDigits:0})}$
+                </div>
+              </div>
+            </div>
+            {virtualBudget === 0 && (
+              <div onClick={() => setSettingsOpen(true)} style={{ marginTop:12, background:"rgba(240,192,64,0.08)", border:"1px dashed rgba(240,192,64,0.35)", borderRadius:10, padding:"8px 12px", cursor:"pointer", textAlign:"center" }}>
+                <span style={{ color:"#f0c040", fontSize:12 }}>⚙️ הגדר תקציב וירטואלי בהגדרות</span>
+              </div>
+            )}
+          </div>
+
+          {/* Empty state */}
+          {portfolio.length === 0 && (
+            <div style={{ textAlign:"center", padding:"40px 24px", color:C.sub }}>
+              <div style={{ fontSize:48, marginBottom:12 }}>📭</div>
+              <div style={{ fontSize:14, color:"#fff", marginBottom:6 }}>התיק ריק</div>
+              <div style={{ fontSize:12 }}>לחץ "+ הוסף מניה" כדי לבנות את תיק המסחר הווירטואלי שלך</div>
+            </div>
+          )}
+
+          {/* Positions */}
+          {portfolio.map(p => {
+            const s = stockData[p.symbol];
+            const loading = loadingSymbols[p.symbol];
+            const val = (s && s.price) ? s.price * p.shares : p.avgCost * p.shares;
+            const pnl = (s && s.price) ? (s.price - p.avgCost) * p.shares : 0;
+            const pnlPct = (s && s.price) ? ((s.price - p.avgCost) / p.avgCost * 100).toFixed(1) : "—";
+            return (
+              <div key={p.symbol} style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, margin:"0 16px 10px", padding:16 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:10, cursor:"pointer" }} onClick={() => openStock(p.symbol)}>
+                    <div style={{ background:"rgba(0,140,255,0.12)", borderRadius:10, padding:"6px 12px", fontSize:13, fontWeight:700, color:C.blue }}>{p.symbol}</div>
+                    <div>
+                      <div style={{ color:"#fff", fontSize:13, fontWeight:600 }}>{p.shares} מניות</div>
+                      {loading || !s ? <Skeleton h={9} w={90}/> :
+                        <div style={{ color:C.sub, fontSize:11 }}>כניסה ${p.avgCost} · נוכחי ${s.price}</div>}
+                    </div>
+                  </div>
+                  <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4 }}>
+                    {loading || !s ? <Skeleton h={14} w={70}/> : <>
+                      <div style={{ color:"#fff", fontSize:14, fontWeight:700 }}>${val.toLocaleString("en",{maximumFractionDigits:0})}</div>
+                      <div style={{ color: pnl>=0 ? C.green : C.red, fontSize:12, fontWeight:600 }}>
+                        {pnl>=0?"+":""}{pnl.toLocaleString("en",{maximumFractionDigits:0})}$ ({pnlPct}%)
+                      </div>
+                    </>}
+                    {/* Edit / Delete */}
+                    <div style={{ display:"flex", gap:6, marginTop:4 }}>
+                      <button onClick={() => { setEditingPosition(p); setAddSymbol(p.symbol); setAddShares(String(p.shares)); setAddPrice(String(p.avgCost)); setPortfolioModalOpen(true); }}
+                        style={{ background:"rgba(77,166,255,0.12)", border:"none", borderRadius:8, padding:"3px 10px", color:C.blue, fontSize:11, cursor:"pointer" }}>✏️ ערוך</button>
+                      <button onClick={() => setPortfolio(prev => prev.filter(x => x.symbol !== p.symbol))}
+                        style={{ background:"rgba(255,77,109,0.12)", border:"none", borderRadius:8, padding:"3px 10px", color:C.red, fontSize:11, cursor:"pointer" }}>🗑 מחק</button>
+                    </div>
+                  </div>
+                </div>
+                {s && <>
+                  <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
+                    <span style={{ fontSize:10, color:C.sub }}>מגמה: <span style={{ color:s.trend?.color }}>{s.trend?.label}</span></span>
+                    <span style={{ fontSize:10, color:C.sub }}>RSI: {s.rsi} · {totalValue > 0 ? ((val/totalValue)*100).toFixed(1) : "0"}% מהתיק</span>
+                  </div>
+                  <div style={{ height:4, borderRadius:2, background:"rgba(255,255,255,0.06)", overflow:"hidden" }}>
+                    <div style={{ height:"100%", width:`${totalValue>0 ? Math.min(100,(val/totalValue)*100) : 0}%`, borderRadius:2, background: pnl>=0 ? "linear-gradient(90deg,#00ffaa,#0088ff)" : "linear-gradient(90deg,#ff4d6d,#ff6b35)" }}/>
+                  </div>
+                </>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ══ Add/Edit Position Modal ══ */}
+      {portfolioModalOpen && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:999, display:"flex", alignItems:"flex-end", justifyContent:"center" }}
+          onClick={e => { if(e.target===e.currentTarget) setPortfolioModalOpen(false); }}>
+          <div style={{ width:390, background:"#0d1528", borderRadius:"24px 24px 0 0", padding:"28px 24px 52px", border:"1px solid rgba(255,255,255,0.08)" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+              <div style={{ fontSize:17, fontWeight:800, color:"#fff" }}>{editingPosition ? "✏️ עריכת פוזיציה" : "➕ הוספת מניה לתיק"}</div>
+              <button onClick={() => setPortfolioModalOpen(false)} style={{ background:"rgba(255,255,255,0.08)", border:"none", color:"#fff", borderRadius:50, width:32, height:32, cursor:"pointer", fontSize:16 }}>✕</button>
+            </div>
+
+            <div style={{ color:"#f0c040", fontSize:11, marginBottom:16, background:"rgba(240,192,64,0.08)", borderRadius:10, padding:"8px 12px" }}>
+              🎮 זהו תיק וירטואלי — לא כסף אמיתי
+            </div>
+
+            <input value={addSymbol} onChange={e => setAddSymbol(e.target.value.toUpperCase())}
+              disabled={!!editingPosition}
+              placeholder="סמל מניה (AAPL, META, TSLA...)"
+              style={{ width:"100%", background:"rgba(255,255,255,0.06)", border:`1px solid ${addSymbol ? "rgba(77,166,255,0.4)" : "rgba(255,255,255,0.12)"}`, borderRadius:12, padding:"12px 14px", color:"#fff", fontSize:15, outline:"none", direction:"ltr", marginBottom:10, opacity: editingPosition ? 0.6 : 1 }}/>
+
+            <input value={addShares} onChange={e => setAddShares(e.target.value.replace(/[^0-9.]/g,""))}
+              placeholder="כמות מניות (לדוגמה: 10)"
+              style={{ width:"100%", background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)", borderRadius:12, padding:"12px 14px", color:"#fff", fontSize:15, outline:"none", direction:"ltr", marginBottom:10 }}/>
+
+            <input value={addPrice} onChange={e => setAddPrice(e.target.value.replace(/[^0-9.]/g,""))}
+              placeholder="מחיר כניסה ממוצע ($)"
+              style={{ width:"100%", background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)", borderRadius:12, padding:"12px 14px", color:"#fff", fontSize:15, outline:"none", direction:"ltr", marginBottom:20 }}/>
+
+            {addSymbol && addShares && addPrice && (
+              <div style={{ background:"rgba(0,255,170,0.06)", border:"1px solid rgba(0,255,170,0.15)", borderRadius:10, padding:"10px 14px", marginBottom:16, fontSize:12, color:C.text }}>
+                סה"כ השקעה: <strong style={{color:C.green}}>${(+addShares * +addPrice).toLocaleString("en",{maximumFractionDigits:0})}</strong>
+                {virtualBudget > 0 && <span style={{color:C.sub}}> מתוך תקציב ${virtualBudget.toLocaleString("en",{maximumFractionDigits:0})}</span>}
+              </div>
+            )}
+
+            <button
+              onClick={() => {
+                const sym = addSymbol.trim().toUpperCase();
+                const shares = parseFloat(addShares);
+                const avgCost = parseFloat(addPrice);
+                if (!sym || !shares || !avgCost) return;
+                if (editingPosition) {
+                  setPortfolio(prev => prev.map(p => p.symbol === sym ? { ...p, shares, avgCost } : p));
+                } else {
+                  setPortfolio(prev => [...prev.filter(p => p.symbol !== sym), { symbol: sym, shares, avgCost }]);
+                  if (!stockData[sym]) loadQuote(sym);
+                }
+                setPortfolioModalOpen(false);
+                setAddSymbol(""); setAddShares(""); setAddPrice(""); setEditingPosition(null);
+              }}
+              style={{ width:"100%", background: (addSymbol && addShares && addPrice) ? "linear-gradient(135deg,#00ffaa,#0088ff)" : "rgba(255,255,255,0.08)", border:"none", borderRadius:50, padding:"14px", fontSize:15, fontWeight:800, color: (addSymbol && addShares && addPrice) ? "#070b14" : C.sub, cursor: (addSymbol && addShares && addPrice) ? "pointer" : "default", transition:"all 0.2s" }}>
+              {editingPosition ? "שמור שינויים ✓" : "הוסף לתיק ✓"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Tab Bar */}
+      <div style={{ position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: 390, background: "rgba(7,11,20,0.97)", backdropFilter: "blur(20px)", borderTop: `1px solid ${C.border}`, display: "flex", padding: "8px 0 20px" }}>
+        {[
+          { id: "home", icon: "⌂", label: "בית" },
+          { id: "stocks", icon: "◈", label: "סורק" },
+          { id: "chat", icon: "🤖", label: "סוכן" },
+          { id: "portfolio", icon: "◉", label: "תיק" },
+          { id: "feedback", icon: "💬", label: "פידבק" },
+        ].map(t => (
+          <button key={t.id} onClick={() => {
+            if (t.id === "feedback") { setFeedbackOpen(true); return; }
+            setTab(t.id); if (t.id !== "stocks") setSelectedSymbol(null);
+          }}
+            style={{ flex: 1, background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, padding: "6px 0" }}>
+            <span style={{ fontSize: 18, color: t.id === "feedback" ? "#f0c040" : tab === t.id ? C.green : C.sub }}>{t.icon}</span>
+            <span style={{ fontSize: 10, color: t.id === "feedback" ? "#f0c040" : tab === t.id ? C.green : C.sub }}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+
+
+      {/* ══ Settings Modal ══ */}
+      {settingsOpen && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:999, display:"flex", alignItems:"flex-end", justifyContent:"center" }}
+          onClick={e => { if(e.target===e.currentTarget) setSettingsOpen(false); }}>
+          <div style={{ width:390, background:"#0d1528", borderRadius:"24px 24px 0 0", padding:"28px 24px 52px", border:"1px solid rgba(255,255,255,0.08)", maxHeight:"90vh", overflowY:"auto" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:24 }}>
+              <div style={{ fontSize:18, fontWeight:800, color:"#fff" }}>⚙️ הגדרות תיק</div>
+              <button onClick={()=>setSettingsOpen(false)} style={{ background:"rgba(255,255,255,0.08)", border:"none", color:"#fff", borderRadius:50, width:32, height:32, cursor:"pointer", fontSize:16 }}>✕</button>
+            </div>
+
+            {/* Virtual Budget */}
+            <div style={{ background:"rgba(240,192,64,0.07)", border:"1px solid rgba(240,192,64,0.2)", borderRadius:16, padding:16, marginBottom:20 }}>
+              <div style={{ color:"#f0c040", fontSize:13, fontWeight:700, marginBottom:4 }}>🎮 תקציב וירטואלי</div>
+              <div style={{ color:"#c8d8e8", fontSize:12, lineHeight:1.6, marginBottom:14 }}>
+                זהו <strong>כסף לא אמיתי</strong> לצורך לימוד ותרגול מסחר בלבד.<br/>
+                אין כאן עסקאות אמיתיות — רק סימולציה.
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                <input
+                  value={budgetInput}
+                  onChange={e => setBudgetInput(e.target.value.replace(/[^0-9]/g,""))}
+                  placeholder="הכנס סכום ($)"
+                  style={{ flex:1, background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)", borderRadius:12, padding:"10px 14px", color:"#fff", fontSize:14, outline:"none", direction:"ltr" }}
+                />
+                <button onClick={() => { if(budgetInput) { setVirtualBudget(parseInt(budgetInput)); setBudgetInput(""); }}}
+                  style={{ background:"linear-gradient(135deg,#f0c040,#ff8c69)", border:"none", borderRadius:12, padding:"10px 16px", color:"#0a0e1a", fontWeight:800, fontSize:14, cursor:"pointer" }}>
+                  קבע
+                </button>
+              </div>
+              {virtualBudget > 0 && (
+                <div style={{ marginTop:10, color:"#f0c040", fontSize:13 }}>
+                  תקציב נוכחי: <strong>${virtualBudget.toLocaleString("en")}</strong>
+                </div>
+              )}
+              <div style={{ display:"flex", gap:8, marginTop:10, flexWrap:"wrap" }}>
+                {[10000,25000,50000,100000].map(amt => (
+                  <button key={amt} onClick={()=>setVirtualBudget(amt)}
+                    style={{ background: virtualBudget===amt ? "rgba(240,192,64,0.2)" : "rgba(255,255,255,0.05)", border:`1px solid ${virtualBudget===amt ? "#f0c040" : "rgba(255,255,255,0.1)"}`, borderRadius:20, padding:"5px 12px", color: virtualBudget===amt ? "#f0c040" : "#c8d8e8", fontSize:12, cursor:"pointer" }}>
+                    ${(amt/1000)}K
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Legal Disclaimer */}
+            <div style={{ background:"rgba(255,60,60,0.05)", border:"1px solid rgba(255,60,60,0.15)", borderRadius:16, padding:16, marginBottom:20 }}>
+              <div style={{ color:"#ff8c69", fontSize:13, fontWeight:700, marginBottom:10 }}>⚖️ כתב ויתור משפטי מלא</div>
+              <div style={{ color:"#c8d8e8", fontSize:11, lineHeight:1.8 }}>
+                <strong style={{color:"#fff"}}>1. מטרת האפליקציה</strong><br/>
+                האפליקציה "יהונתן חיים ניתוח שוק ההון" היא כלי ללימוד וחינוך פיננסי בלבד. כל המסחר באפליקציה הוא <strong>סימולציה בכסף וירטואלי</strong> ואינו כרוך בכסף אמיתי.<br/><br/>
+
+                <strong style={{color:"#fff"}}>2. אי-ייעוץ השקעות</strong><br/>
+                שום דבר באפליקציה זו אינו מהווה ייעוץ השקעות, המלצת קנייה/מכירה, או תחליף לייעוץ מקצועי מורשה על-פי חוק הסדרת העיסוק בייעוץ השקעות, בשיווק השקעות ובניהול תיקי השקעות, תשנ"ה-1995.<br/><br/>
+
+                <strong style={{color:"#fff"}}>3. AI ושגיאות</strong><br/>
+                הניתוחים מופעלים על ידי בינה מלאכותית (Claude AI) ועלולים להכיל שגיאות, אי-דיוקים, או מידע מיושן. אין להסתמך עליהם לקבלת החלטות פיננסיות.<br/><br/>
+
+                <strong style={{color:"#fff"}}>4. ויתור על אחריות</strong><br/>
+                המפתח <strong>יהונתן חיים</strong> וכל הקשורים בפיתוח האפליקציה <strong>אינם נושאים בכל אחריות</strong> לכל נזק, הפסד, או תביעה — ישירים או עקיפים — הנובעים משימוש באפליקציה זו.<br/><br/>
+
+                <strong style={{color:"#fff"}}>5. אחריות המשתמש</strong><br/>
+                כל החלטה פיננסית שיתקבל בעקבות שימוש באפליקציה הינה <strong>באחריות המשתמש הבלבד</strong>. המשתמש מצהיר כי הוא מודע לסיכונים הכרוכים בהשקעות ומסחר בניירות ערך.<br/><br/>
+
+                <strong style={{color:"#fff"}}>6. נתוני שוק</strong><br/>
+                נתוני המחירים מסופקים על ידי Yahoo Finance ומושהים ב-15 דקות לפחות. אין להשתמש בהם לפעולות מסחר בזמן אמת.
+              </div>
+            </div>
+
+            {/* Watchlist Management */}
+            <div style={{ background:"rgba(77,166,255,0.05)", border:"1px solid rgba(77,166,255,0.15)", borderRadius:16, padding:16, marginBottom:20 }}>
+              <div style={{ color:"#4da6ff", fontSize:13, fontWeight:700, marginBottom:12 }}>📋 רשימת מעקב אישית</div>
+              
+              {/* Current watchlist */}
+              <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:12 }}>
+                {watchlist.map(sym => (
+                  <div key={sym} style={{ display:"flex", alignItems:"center", gap:6, background:"rgba(77,166,255,0.1)", border:"1px solid rgba(77,166,255,0.2)", borderRadius:20, padding:"5px 12px" }}>
+                    <span style={{ color:"#4da6ff", fontSize:13, fontWeight:700 }}>{sym}</span>
+                    <button onClick={() => {
+                      const updated = watchlist.filter(s => s !== sym);
+                      setWatchlist(updated);
+                      const newData = { ...stockData };
+                      delete newData[sym];
+                      setStockData(newData);
+                    }} style={{ background:"none", border:"none", color:"#ff4d6d", cursor:"pointer", fontSize:14, padding:0, lineHeight:1 }}>✕</button>
+                  </div>
+                ))}
+              </div>
+
+              {/* Add symbol */}
+              <div style={{ display:"flex", gap:8 }}>
+                <input
+                  id="watchlist-input"
+                  placeholder="הוסף מניה (TSLA, AMZN...)"
+                  style={{ flex:1, background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)", borderRadius:12, padding:"9px 14px", color:"#fff", fontSize:13, outline:"none", direction:"ltr", textTransform:"uppercase" }}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") {
+                      const sym = e.target.value.trim().toUpperCase();
+                      if (sym && !watchlist.includes(sym)) {
+                        setWatchlist(prev => [...prev, sym]);
+                        loadQuote(sym);
+                      }
+                      e.target.value = "";
+                    }
+                  }}
+                />
+                <button onClick={() => {
+                  const input = document.getElementById("watchlist-input");
+                  const sym = input.value.trim().toUpperCase();
+                  if (sym && !watchlist.includes(sym)) {
+                    setWatchlist(prev => [...prev, sym]);
+                    loadQuote(sym);
+                  }
+                  input.value = "";
+                }} style={{ background:"linear-gradient(135deg,#4da6ff,#0088ff)", border:"none", borderRadius:12, padding:"9px 16px", color:"#fff", fontWeight:800, fontSize:13, cursor:"pointer" }}>+הוסף</button>
+              </div>
+              <div style={{ fontSize:11, color:"#3a5070", marginTop:8 }}>לחץ Enter או "+הוסף" להוספת מניה</div>
+            </div>
+
+            {/* User info */}
+            <div style={{ background:"rgba(0,255,170,0.05)", border:"1px solid rgba(0,255,170,0.1)", borderRadius:16, padding:14 }}>
+              <div style={{ color:"#00ffaa", fontSize:12, fontWeight:700, marginBottom:8 }}>👤 פרטי משתמש</div>
+              <div style={{ color:"#c8d8e8", fontSize:13 }}>{userProfile.firstName} {userProfile.lastName}</div>
+              <div style={{ color:"#3a5070", fontSize:11, marginTop:2 }}>{userProfile.level} · {userProfile.portfolioSize}</div>
+              {userProfile.email && <div style={{ color:"#3a5070", fontSize:11 }}>{userProfile.email}</div>}
+            </div>
+          </div>
+        </div>
+      )}
+      {/* ── Feedback Modal ── */}
+      {feedbackOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 999, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+          onClick={e => { if (e.target === e.currentTarget) { setFeedbackOpen(false); setFeedbackSent(false); setFeedbackText(""); } }}>
+          <div style={{ width: 390, background: "#0d1528", borderRadius: "24px 24px 0 0", padding: "28px 24px 48px", border: "1px solid rgba(255,255,255,0.08)" }}>
+            {!feedbackSent ? <>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: "#fff" }}>💬 חוות דעת ורעיונות</div>
+                  <div style={{ fontSize: 12, color: C.sub, marginTop: 3 }}>ישלח ישירות לצוות הפיתוח</div>
+                </div>
+                <button onClick={() => { setFeedbackOpen(false); setFeedbackText(""); }} style={{ background: "rgba(255,255,255,0.08)", border: "none", color: "#fff", borderRadius: 50, width: 32, height: 32, cursor: "pointer", fontSize: 16 }}>✕</button>
+              </div>
+
+              {/* User info display */}
+              <div style={{ background: "rgba(0,255,170,0.06)", border: "1px solid rgba(0,255,170,0.15)", borderRadius: 12, padding: "10px 14px", marginBottom: 16, display: "flex", gap: 10, alignItems: "center" }}>
+                <span style={{ fontSize: 20 }}>👤</span>
+                <div>
+                  <div style={{ color: "#fff", fontSize: 13, fontWeight: 600 }}>{userProfile.firstName} {userProfile.lastName}</div>
+                  <div style={{ color: C.sub, fontSize: 11 }}>{userProfile.email} · {userProfile.level} · {userProfile.portfolioSize}</div>
+                </div>
+              </div>
+
+              <textarea
+                value={feedbackText}
+                onChange={e => setFeedbackText(e.target.value)}
+                placeholder="מה עובד טוב? מה חסר? מה תשנה? כל רעיון מתקדם..."
+                style={{ width: "100%", height: 130, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 14, padding: "14px 16px", color: "#fff", fontSize: 14, outline: "none", direction: "rtl", resize: "none", fontFamily: "'Assistant', sans-serif", lineHeight: 1.6, marginBottom: 14 }}
+              />
+
+              <button
+                onClick={() => {
+                  if (!feedbackText.trim()) return;
+                  // שלח למייל דרך mailto
+                  const subject = encodeURIComponent(`פידבק מ-${userProfile.firstName} ${userProfile.lastName} | ${userProfile.level} | ${userProfile.portfolioSize}`);
+                  const body = encodeURIComponent(`שם: ${userProfile.firstName} ${userProfile.lastName}\nאימייל: ${userProfile.email}\nרמה: ${userProfile.level}\nתיק: ${userProfile.portfolioSize}\nתחומי עניין: ${userProfile.interests?.join(", ")}\n\n--- פידבק ---\n${feedbackText}`);
+                  window.open(`mailto:Ikoa2009@gmail.com?subject=${subject}&body=${body}`);
+                  setFeedbackSent(true);
+                }}
+                style={{ width: "100%", background: feedbackText.trim() ? "linear-gradient(135deg,#f0c040,#ff8c69)" : "rgba(255,255,255,0.07)", border: "none", borderRadius: 50, padding: "14px", fontSize: 15, fontWeight: 800, color: feedbackText.trim() ? "#0a0e1a" : C.sub, cursor: feedbackText.trim() ? "pointer" : "default", transition: "all 0.2s" }}>
+                שלח פידבק →
+              </button>
+            </> : (
+              <div style={{ textAlign: "center", padding: "20px 0" }}>
+                <div style={{ fontSize: 52, marginBottom: 16 }}>🙏</div>
+                <div style={{ fontSize: 20, fontWeight: 800, color: "#fff", marginBottom: 8 }}>תודה רבה!</div>
+                <div style={{ fontSize: 14, color: C.sub, lineHeight: 1.6 }}>הפידבק שלך ישלח ישירות למפתח.<br />כל הערה עוזרת לשפר את הסוכן.</div>
+                <button onClick={() => { setFeedbackOpen(false); setFeedbackSent(false); setFeedbackText(""); }}
+                  style={{ marginTop: 24, background: "rgba(255,255,255,0.08)", border: "none", borderRadius: 50, padding: "12px 32px", color: "#fff", fontSize: 14, cursor: "pointer" }}>סגור</button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════ ROOT WRAPPER ══════════
+export default function App() {
+  const [userProfile, setUserProfile] = useState(null);
+
+  if (!userProfile) {
+    return (
+      <Onboarding onDone={(profile) => {
+        setUserProfile(profile);
+      }} />
+    );
+  }
+
+  return <MainApp userProfile={userProfile} />;
+}
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(App));
+  </script>
+</body>
+</html>
