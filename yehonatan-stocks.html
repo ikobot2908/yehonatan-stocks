@@ -6,7 +6,8 @@
   <title>יהונתן חיים ניתוח שוק ההון</title>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.8/babel.min.js"></script>
+  <script src="paper-trading-engine.js"></script>
   <style>
     * { margin:0; padding:0; box-sizing:border-box; }
     body { background:#070b14; overflow-x:hidden; }
@@ -14,8 +15,8 @@
 </head>
 <body>
   <div id="root"></div>
-  <script type="text/babel">
-import { useState, useEffect, useRef } from "react";
+  <script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
 
 // ── Safe number helper ──
 const safe = (n, fallback = 0) => (typeof n === "number" && !isNaN(n) ? n : fallback);
@@ -179,42 +180,6 @@ function buildResult(symbol, price, prevClose, candles, extra = {}) {
   return { symbol, price, change, changeP, prevClose, candles, rsi, sma20, sma50, floor, ceiling, trend, relVol, high52, low52, ...extra };
 }
 
-function buildSyntheticCandles(price, changeP, high52, low52) {
-  const candles = [];
-  let p = (low52 || price * 0.75) + ((high52 || price * 1.25) - (low52 || price * 0.75)) * 0.4;
-  for (let i = 0; i < 60; i++) {
-    const o = p;
-    const c = Math.max(o + (Math.random() - 0.47) * price * 0.013, price * 0.55);
-    candles.push({ o, h: Math.max(o,c) + Math.random()*price*0.004, l: Math.min(o,c) - Math.random()*price*0.004, c, v: Math.floor(3e6 + Math.random()*8e6) });
-    p = c;
-  }
-  candles[candles.length-1].c = price;
-  candles[candles.length-1].o = prevClose => price * (1 - (changeP||0)/100);
-  return candles;
-}
-
-async function fetchViaClaudeSearch(symbol) {
-  try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 400,
-        tools: [{ type: "web_search_20250305", name: "web_search" }],
-        system: "Return ONLY raw JSON object, no markdown, no explanation, no backticks.",
-        messages: [{ role: "user", content: `Current stock price for ${symbol}. Return only: {"price":number,"change":number,"changeP":number,"high52":number,"low52":number,"date":"YYYY-MM-DD"}` }]
-      })
-    });
-    const data = await res.json();
-    const text = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
-    const match = text.match(/\{[^{}]+\}/);
-    if (!match) return null;
-    const parsed = JSON.parse(match[0]);
-    return (parsed.price && !isNaN(parsed.price)) ? parsed : null;
-  } catch(e) { return null; }
-}
-
 async function fetchQuote(symbol) {
   const today = new Date().toLocaleDateString("he-IL");
 
@@ -281,6 +246,53 @@ const INITIAL_SYMBOLS = ["AAPL","MSFT","GOOGL","META","NVDA","JEPI"];
 
 // Portfolio is managed per-user via settings
 const PORTFOLIO_BASE = [];
+
+// ══════════ מסחר נייר (Paper Trading) — הון וירטואלי נפרד לגמרי ══════════
+// מודול עצמאי: לא נוגע בתיק הווירטואלי הרגיל (portfolio/virtualBudget) ובוודאי
+// לא במסחר אמיתי. כל הלוגיקה הכמותית (עמלות, אינדיקטורים, ניקוד, תיק) חיה
+// ב-paper-trading-engine.js הנפרד, שיש לו unit tests משלו.
+const PT = window.PaperTradingEngine;
+const PAPER_STORAGE_KEY = "paperTradingState_v1";
+const PAPER_SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 דק', כמו סריקת ליבת ה-watchlist
+const PAPER_DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL"];
+
+function loadPaperState() {
+  try {
+    const raw = localStorage.getItem(PAPER_STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return {
+    portfolio: PT.createPaperPortfolio(),
+    log: [],
+    watchlist: PAPER_DEFAULT_WATCHLIST,
+    lastPrices: {},
+    baselinePrices: {},
+    startDate: new Date().toISOString().slice(0, 10),
+    lastScanAt: null,
+  };
+}
+
+function savePaperState(state) {
+  try { localStorage.setItem(PAPER_STORAGE_KEY, JSON.stringify(state)); } catch (e) {}
+}
+
+// תיק נייר חדש לגמרי (שומר על אותה רשימת מעקב, מאפס הון/לוג/היסטוריה)
+function loadFreshPaperState(watchlist = PAPER_DEFAULT_WATCHLIST) {
+  return {
+    portfolio: PT.createPaperPortfolio(),
+    log: [],
+    watchlist,
+    lastPrices: {},
+    baselinePrices: {},
+    startDate: new Date().toISOString().slice(0, 10),
+    lastScanAt: null,
+  };
+}
+
+function fmtDateHe(d) {
+  if (!d) return "—";
+  try { return new Date(d).toLocaleDateString("he-IL"); } catch (e) { return d; }
+}
 
 // ── Candlestick Chart ──
 function CandleChart({ candles, floor, ceiling }) {
@@ -600,6 +612,12 @@ function MainApp({ userProfile, onLogout }) {
   const [addPrice, setAddPrice] = useState("");
   const [editingPosition, setEditingPosition] = useState(null);
 
+  // ── מסחר נייר (Paper Trading) — מצב נפרד לגמרי מהתיק הווירטואלי הרגיל ──
+  const [paperState, setPaperState] = useState(() => loadPaperState());
+  const [paperScanning, setPaperScanning] = useState(false);
+  const [paperAddSymbol, setPaperAddSymbol] = useState("");
+  const [paperResetConfirm, setPaperResetConfirm] = useState(false);
+
   // profile is always set here
 
   // Load quote for a symbol
@@ -861,12 +879,145 @@ ${portSnap || "ריק"}
     }, 100);
   }
 
+  // ── שמירת מצב מסחר הנייר בכל שינוי ──
+  useEffect(() => { savePaperState(paperState); }, [paperState]);
+
+  // ── סריקת מסחר נייר: טווח → פריצה, לפי כל ה-watchlist הייעודי ──
+  async function runPaperScan() {
+    if (paperScanning) return;
+    setPaperScanning(true);
+    const today = new Date().toISOString().slice(0, 10);
+    const state = JSON.parse(JSON.stringify(paperState));
+    if (!state.lastPrices) state.lastPrices = {};
+    if (!state.baselinePrices) state.baselinePrices = {};
+    const newEntries = [];
+
+    for (const symbol of state.watchlist) {
+      let quote;
+      try {
+        quote = await fetchQuote(symbol);
+      } catch (e) {
+        newEntries.push({ date: today, symbol, stage: "שגיאת נתונים", score: null, action: "דילוג", effectivePrice: null, reason: "לא ניתן היה למשוך נתונים", outcome: null });
+        continue;
+      }
+      const candles = quote.candles;
+      const price = quote.price;
+      state.lastPrices[symbol] = price;
+      if (!(symbol in state.baselinePrices)) state.baselinePrices[symbol] = price;
+
+      // פוזיציה פתוחה קיימת — רק בדיקת תנאי יציאה, לא מחפשים כניסה חדשה
+      if (PT.hasOpenPosition(state.portfolio, symbol)) {
+        const position = state.portfolio.positions.find(p => p.symbol === symbol);
+        const decision = PT.evaluateOpenPosition(position, price, today);
+        if (decision.action === "sell") {
+          const trade = PT.closePaperPosition(state.portfolio, symbol, { price, date: today, reason: decision.reason });
+          newEntries.push({ date: today, symbol, stage: "פוזיציה נסגרה", score: null, action: `מכירה — ${decision.reason}`, effectivePrice: trade.exitEffectivePrice, reason: decision.reason, outcome: `P&L: ${trade.pnl >= 0 ? "+" : ""}$${trade.pnl}` });
+        } else {
+          newEntries.push({ date: today, symbol, stage: "פוזיציה פתוחה", score: null, action: "החזקה", effectivePrice: price, reason: null, outcome: null });
+        }
+        continue;
+      }
+
+      if (!candles || candles.length < PT.RANGE_MIN_DAYS + 1) {
+        newEntries.push({ date: today, symbol, stage: "נתונים לא מספיקים", score: null, action: "דילוג", effectivePrice: price, reason: "פחות מ-20 ימי מסחר בהיסטוריה", outcome: null });
+        continue;
+      }
+
+      const range = PT.detectRange(candles);
+      if (!range) {
+        newEntries.push({ date: today, symbol, stage: "אין טווח מתאים", score: null, action: "דילוג", effectivePrice: price, reason: "לא נמצא טווח דשדוש של 4-8 שבועות עד 15% רוחב", outcome: null });
+        continue;
+      }
+
+      const volInfo = PT.isVolumeContracting(candles, range);
+      if (volInfo && !volInfo.contracting) {
+        newEntries.push({ date: today, symbol, stage: "טווח לא תקף", score: null, action: "דילוג", effectivePrice: price, reason: "נפח בטווח לא יורד לעומת התקופה הקודמת", outcome: null });
+        continue;
+      }
+
+      const classification = PT.classifyAccumulationDistribution(candles, range);
+      if (classification.classification === "distribution") {
+        newEntries.push({ date: today, symbol, stage: "חלוקה — נדחה", score: null, action: "לא נכנס", effectivePrice: price, reason: "חלוקה, לא צבירה (OBV יורד)", outcome: null, classification: "distribution", priceAtLog: price });
+        continue;
+      }
+
+      const breakout = PT.detectBreakout(candles, range);
+      if (!breakout.confirmed) {
+        newEntries.push({ date: today, symbol, stage: "בטווח — ממתין לפריצה", score: null, action: "המתנה", effectivePrice: price, reason: !breakout.closedAboveHigh ? "עדיין בתוך הטווח" : "נפח פריצה לא מספיק (נדרש פי 1.5)", outcome: null, classification: "accumulation", priceAtLog: price });
+        continue;
+      }
+
+      const score = PT.scoreCandidate(candles, range, breakout, "accumulation");
+      if (!score.passesThreshold) {
+        newEntries.push({ date: today, symbol, stage: "פריצה — ציון נמוך", score: score.scoreOutOf10, action: "דחייה", effectivePrice: price, reason: `ציון ${score.scoreOutOf10}/10 מתחת לסף 7/10`, outcome: null });
+        continue;
+      }
+
+      const atr = PT.calcATR(candles);
+      const stop = PT.calcStopLoss(range, atr);
+      const target = PT.calcTakeProfit(range, breakout.breakoutPrice);
+      const position = PT.openPaperPosition(state.portfolio, { symbol, price: breakout.breakoutPrice, date: today, stop, target });
+      if (!position) {
+        newEntries.push({ date: today, symbol, stage: "פריצה מאושרת", score: score.scoreOutOf10, action: "אין מספיק מזומן פנוי", effectivePrice: price, reason: "מזומן זמין לא מספיק לפתיחת פוזיציה", outcome: null });
+      } else {
+        newEntries.push({ date: today, symbol, stage: "פריצה מאושרת", score: score.scoreOutOf10, action: "קנייה", effectivePrice: position.entryEffectivePrice, reason: `סטופ $${stop} · יעד $${target}`, outcome: null });
+      }
+    }
+
+    state.log = [...newEntries, ...state.log].slice(0, 300);
+    state.lastScanAt = new Date().toISOString();
+    setPaperState(state);
+    setPaperScanning(false);
+  }
+
+  // סריקה אוטומטית כל 30 דק' כל עוד האפליקציה פתוחה (אין שרת רקע בפריסה סטטית זו)
+  useEffect(() => {
+    const iv = setInterval(runPaperScan, PAPER_SCAN_INTERVAL_MS);
+    return () => clearInterval(iv);
+  }, [paperState, paperScanning]);
+
+  // סריקה מיידית כשנכנסים לטאב אם עברו יותר מ-30 דק' מהסריקה האחרונה
+  useEffect(() => {
+    if (tab === "paper") {
+      const last = paperState.lastScanAt ? new Date(paperState.lastScanAt).getTime() : 0;
+      if (Date.now() - last > PAPER_SCAN_INTERVAL_MS) runPaperScan();
+    }
+  }, [tab]);
+
   const C = { bg: "#070b14", card: "rgba(255,255,255,0.03)", border: "rgba(255,255,255,0.07)", green: "#00ffaa", red: "#ff4d6d", blue: "#4da6ff", yellow: "#f0c040", text: "#c8d8e8", sub: "#3a5070" };
 
   const displaySymbols = Object.keys(stockData).filter(s =>
     s.toLowerCase().includes(searchQuery.toLowerCase()) ||
     (stockData[s]?.name || "").toLowerCase().includes(searchQuery.toLowerCase())
   );
+
+  // ── חישובים לתצוגת מסחר נייר ──
+  const paperSnapshot = PT.markToMarket(paperState.portfolio, paperState.lastPrices || {});
+  const paperMetrics = PT.computeTradeMetrics(paperState.portfolio.closedTrades);
+  const paperDaysElapsed = Math.floor((Date.now() - new Date(paperState.startDate).getTime()) / (24 * 3600 * 1000));
+  const paperDistributionRejections = paperState.log.filter(l => l.classification === "distribution");
+  const paperDistributionAudit = paperDistributionRejections.map(l => {
+    const laterPrice = paperState.lastPrices?.[l.symbol];
+    return (laterPrice != null) ? PT.auditDistributionRejection(l, laterPrice) : { ...l, correct: null };
+  });
+  const paperDistributionCorrect = paperDistributionAudit.filter(a => a.correct === true).length;
+  const paperDistributionChecked = paperDistributionAudit.filter(a => a.correct !== null).length;
+  const paperBuyHoldBasket = (() => {
+    const symbols = Object.keys(paperState.baselinePrices || {});
+    if (!symbols.length) return null;
+    const perSymbolBudget = paperState.portfolio.startingCapital / symbols.length;
+    let startValue = 0, currentValue = 0;
+    symbols.forEach(sym => {
+      const base = paperState.baselinePrices[sym];
+      const now = paperState.lastPrices?.[sym] ?? base;
+      const shares = base ? perSymbolBudget / base : 0;
+      startValue += shares * base;
+      currentValue += shares * now;
+    });
+    const pnl = PT.round2(currentValue - startValue);
+    const pnlPct = startValue ? PT.round2((pnl / startValue) * 100) : 0;
+    return { startValue: PT.round2(startValue), currentValue: PT.round2(currentValue), pnl, pnlPct };
+  })();
 
   return (
     <div style={{ maxWidth: 390, margin: "0 auto", minHeight: "100vh", background: C.bg, fontFamily: "'Assistant', sans-serif", direction: "rtl", position: "relative" }}>
@@ -1330,6 +1481,185 @@ ${portSnap || "ריק"}
         </div>
       )}
 
+      {/* ══ מסחר נייר (Paper Trading) ══ */}
+      {tab === "paper" && (
+        <div style={{ paddingBottom: 90, animation: "fadeUp .3s ease" }}>
+          <div style={{ padding: "52px 16px 12px", background: "linear-gradient(180deg,#0d1528,transparent)" }}>
+            <div style={{ fontSize: 20, fontWeight: 800, color: "#fff" }}>🧪 מסחר נייר — ניסוי חודשי</div>
+            <div style={{ fontSize: 11, color: C.sub, marginTop: 4 }}>
+              הון וירטואלי נפרד לגמרי · יום {Math.max(1, paperDaysElapsed + 1)} מתוך 30 · שיטת טווח→פריצה (Wyckoff)
+            </div>
+            <div style={{ fontSize: 10, color: "#f0c040", marginTop: 6, lineHeight: 1.6 }}>
+              ⚠️ הסריקה רצה רק כשהאפליקציה פתוחה בדפדפן (אין שרת רקע בפריסה הזו) — כל 30 דק' אוטומטית, או ידנית בכפתור למטה.
+            </div>
+          </div>
+
+          {/* Summary card */}
+          <div style={{ background: "linear-gradient(135deg,#0d1f3c,#0a1628)", border: "1px solid rgba(0,140,255,0.2)", borderRadius: 20, padding: 20, margin: "0 16px 14px" }}>
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+              <div>
+                <div style={{ fontSize: 10, color: C.sub }}>שווי תיק</div>
+                <div style={{ fontSize: 26, fontWeight: 800, color: "#fff" }}>${paperSnapshot.equity.toLocaleString("en", { maximumFractionDigits: 2 })}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: C.sub }}>מזומן פנוי</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.green }}>${paperSnapshot.cash.toLocaleString("en", { maximumFractionDigits: 2 })}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: C.sub }}>רווח/הפסד נטו</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: paperSnapshot.totalPnL >= 0 ? C.green : C.red }}>
+                  {paperSnapshot.totalPnL >= 0 ? "+" : ""}${paperSnapshot.totalPnL.toLocaleString("en", { maximumFractionDigits: 2 })} ({paperSnapshot.totalPnLPct >= 0 ? "+" : ""}{paperSnapshot.totalPnLPct}%)
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: C.sub }}>עסקאות שנסגרו</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: "#fff" }}>{paperMetrics.count}</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+              <button onClick={runPaperScan} disabled={paperScanning}
+                style={{ flex: 1, background: paperScanning ? "rgba(255,255,255,0.08)" : "linear-gradient(135deg,#00ffaa,#0088ff)", border: "none", borderRadius: 14, padding: "10px", color: paperScanning ? C.sub : "#070b14", fontWeight: 800, fontSize: 13, cursor: paperScanning ? "default" : "pointer" }}>
+                {paperScanning ? "⏳ סורק..." : "🔍 הרץ סריקה עכשיו"}
+              </button>
+            </div>
+            {paperState.lastScanAt && (
+              <div style={{ fontSize: 10, color: C.sub, marginTop: 8 }}>סריקה אחרונה: {new Date(paperState.lastScanAt).toLocaleString("he-IL")}</div>
+            )}
+          </div>
+
+          {/* Open positions */}
+          <div style={{ padding: "0 16px 6px" }}>
+            <div style={{ fontSize: 12, color: "#fff", fontWeight: 700, marginBottom: 8 }}>פוזיציות פתוחות ({paperState.portfolio.positions.length})</div>
+          </div>
+          {paperState.portfolio.positions.length === 0 && (
+            <div style={{ margin: "0 16px 14px", color: C.sub, fontSize: 12, textAlign: "center", padding: "16px 0" }}>אין פוזיציות פתוחות כרגע</div>
+          )}
+          {paperState.portfolio.positions.map(p => {
+            const current = paperState.lastPrices?.[p.symbol] ?? p.entryPrice;
+            const unrealized = PT.round2((current - p.entryEffectivePrice) * p.shares);
+            return (
+              <div key={p.symbol} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, margin: "0 16px 10px", padding: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                  <div style={{ color: C.blue, fontWeight: 700, fontSize: 13 }}>{p.symbol} · {p.shares} מניות</div>
+                  <div style={{ color: unrealized >= 0 ? C.green : C.red, fontWeight: 700, fontSize: 13 }}>{unrealized >= 0 ? "+" : ""}${unrealized}</div>
+                </div>
+                <div style={{ fontSize: 11, color: C.sub }}>כניסה אפקטיבי ${p.entryEffectivePrice} · נוכחי ${current} · {fmtDateHe(p.entryDate)}</div>
+                <div style={{ fontSize: 11, color: C.sub, marginTop: 2 }}>🛑 סטופ ${p.stop} · 🎯 יעד ${p.target}</div>
+              </div>
+            );
+          })}
+
+          {/* Closed trades */}
+          <div style={{ padding: "10px 16px 6px" }}>
+            <div style={{ fontSize: 12, color: "#fff", fontWeight: 700, marginBottom: 8 }}>עסקאות שנסגרו ({paperState.portfolio.closedTrades.length})</div>
+          </div>
+          {paperState.portfolio.closedTrades.length === 0 && (
+            <div style={{ margin: "0 16px 14px", color: C.sub, fontSize: 12, textAlign: "center", padding: "10px 0" }}>עדיין אין עסקאות סגורות</div>
+          )}
+          {[...paperState.portfolio.closedTrades].reverse().map((t, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 16px", borderBottom: `1px solid ${C.border}` }}>
+              <div>
+                <div style={{ color: "#fff", fontSize: 12, fontWeight: 700 }}>{t.symbol} · {t.shares} מניות</div>
+                <div style={{ color: C.sub, fontSize: 10 }}>${t.entryEffectivePrice} ← ${t.exitEffectivePrice} · {t.reason}</div>
+              </div>
+              <div style={{ color: t.pnl >= 0 ? C.green : C.red, fontWeight: 700, fontSize: 13 }}>{t.pnl >= 0 ? "+" : ""}${t.pnl}</div>
+            </div>
+          ))}
+
+          {/* מדדי הצלחה */}
+          <div style={{ margin: "16px 16px 0", background: "rgba(240,192,64,0.06)", border: "1px solid rgba(240,192,64,0.2)", borderRadius: 16, padding: 16 }}>
+            <div style={{ color: "#f0c040", fontSize: 13, fontWeight: 700, marginBottom: 10 }}>📊 מדדי הצלחה (מצטבר)</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 12, color: C.text }}>
+              <div>Win rate: <strong style={{ color: "#fff" }}>{paperMetrics.winRate}%</strong></div>
+              <div>רווח ממוצע: <strong style={{ color: C.green }}>${paperMetrics.avgWin}</strong></div>
+              <div>הפסד ממוצע: <strong style={{ color: C.red }}>${paperMetrics.avgLoss}</strong></div>
+              <div>יחס רווח/הפסד: <strong style={{ color: "#fff" }}>{paperMetrics.winLossRatio ?? "—"}</strong></div>
+            </div>
+            <div style={{ marginTop: 10, fontSize: 12, color: C.text }}>
+              דיוק הבחנת חלוקה: <strong style={{ color: "#fff" }}>{paperDistributionChecked ? `${paperDistributionCorrect}/${paperDistributionChecked}` : "—"}</strong>
+              <span style={{ color: C.sub }}> (מועמדים שנדחו כ"חלוקה" ובאמת לא עלו מאז)</span>
+            </div>
+            {paperBuyHoldBasket && (
+              <div style={{ marginTop: 10, fontSize: 12, color: C.text }}>
+                השוואה ל-Buy & Hold (סל שווה-משקל על אותם טיקרים): <strong style={{ color: paperBuyHoldBasket.pnlPct >= 0 ? C.green : C.red }}>{paperBuyHoldBasket.pnlPct >= 0 ? "+" : ""}{paperBuyHoldBasket.pnlPct}%</strong>
+                <span style={{ color: C.sub }}> מול </span>
+                <strong style={{ color: paperSnapshot.totalPnLPct >= 0 ? C.green : C.red }}>{paperSnapshot.totalPnLPct >= 0 ? "+" : ""}{paperSnapshot.totalPnLPct}%</strong>
+                <span style={{ color: C.sub }}> באסטרטגיה</span>
+              </div>
+            )}
+          </div>
+
+          {/* לוג סריקה */}
+          <div style={{ padding: "16px 16px 6px" }}>
+            <div style={{ fontSize: 12, color: "#fff", fontWeight: 700 }}>לוג סריקה (כולל מועמדים שנדחו)</div>
+          </div>
+          {paperState.log.slice(0, 40).map((l, i) => (
+            <div key={i} style={{ padding: "8px 16px", borderBottom: `1px solid ${C.border}` }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: C.blue, fontSize: 12, fontWeight: 700 }}>{l.symbol}</span>
+                <span style={{ color: C.sub, fontSize: 10 }}>{fmtDateHe(l.date)}</span>
+              </div>
+              <div style={{ fontSize: 11, color: "#fff", marginTop: 2 }}>{l.stage} {l.score != null ? `· ציון ${l.score}/10` : ""} · {l.action}</div>
+              {l.reason && <div style={{ fontSize: 10, color: C.sub, marginTop: 1 }}>{l.reason}</div>}
+              {l.outcome && <div style={{ fontSize: 10, color: C.green, marginTop: 1 }}>{l.outcome}</div>}
+            </div>
+          ))}
+          {paperState.log.length === 0 && (
+            <div style={{ margin: "0 16px", color: C.sub, fontSize: 12, textAlign: "center", padding: "16px 0" }}>עדיין לא בוצעה סריקה</div>
+          )}
+
+          {/* ניהול watchlist למסחר נייר */}
+          <div style={{ margin: "16px 16px 0", background: "rgba(77,166,255,0.05)", border: "1px solid rgba(77,166,255,0.15)", borderRadius: 16, padding: 16 }}>
+            <div style={{ color: "#4da6ff", fontSize: 12, fontWeight: 700, marginBottom: 10 }}>📋 רשימת סריקה למסחר נייר</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+              {paperState.watchlist.map(sym => (
+                <div key={sym} style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(77,166,255,0.1)", border: "1px solid rgba(77,166,255,0.2)", borderRadius: 20, padding: "5px 12px" }}>
+                  <span style={{ color: "#4da6ff", fontSize: 12, fontWeight: 700 }}>{sym}</span>
+                  <button onClick={() => setPaperState(s => ({ ...s, watchlist: s.watchlist.filter(x => x !== sym) }))}
+                    style={{ background: "none", border: "none", color: C.red, cursor: "pointer", fontSize: 13, padding: 0 }}>✕</button>
+                </div>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input value={paperAddSymbol} onChange={e => setPaperAddSymbol(e.target.value.toUpperCase())}
+                onKeyDown={e => {
+                  if (e.key === "Enter" && paperAddSymbol.trim() && !paperState.watchlist.includes(paperAddSymbol.trim())) {
+                    setPaperState(s => ({ ...s, watchlist: [...s.watchlist, paperAddSymbol.trim()] }));
+                    setPaperAddSymbol("");
+                  }
+                }}
+                placeholder="הוסף טיקר (IBM, AMD...)"
+                style={{ flex: 1, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 12, padding: "9px 14px", color: "#fff", fontSize: 13, outline: "none", direction: "ltr" }} />
+              <button onClick={() => {
+                const sym = paperAddSymbol.trim();
+                if (sym && !paperState.watchlist.includes(sym)) setPaperState(s => ({ ...s, watchlist: [...s.watchlist, sym] }));
+                setPaperAddSymbol("");
+              }} style={{ background: "linear-gradient(135deg,#4da6ff,#0088ff)", border: "none", borderRadius: 12, padding: "9px 16px", color: "#fff", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>+הוסף</button>
+            </div>
+          </div>
+
+          {/* איפוס ניסוי */}
+          <div style={{ margin: "14px 16px 0", textAlign: "center" }}>
+            {!paperResetConfirm ? (
+              <button onClick={() => setPaperResetConfirm(true)}
+                style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 20, padding: "8px 18px", color: C.sub, fontSize: 11, cursor: "pointer" }}>
+                ↺ אפס ניסוי (חזרה ל-$1,000)
+              </button>
+            ) : (
+              <div style={{ background: "rgba(255,77,109,0.08)", border: "1px solid rgba(255,77,109,0.25)", borderRadius: 14, padding: 12 }}>
+                <div style={{ color: "#fff", fontSize: 12, marginBottom: 8 }}>למחוק את כל הפוזיציות, הלוג וההיסטוריה ולהתחיל מחדש?</div>
+                <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+                  <button onClick={() => { setPaperState(loadFreshPaperState(paperState.watchlist)); setPaperResetConfirm(false); }}
+                    style={{ background: C.red, border: "none", borderRadius: 12, padding: "6px 16px", color: "#fff", fontSize: 12, cursor: "pointer" }}>כן, אפס</button>
+                  <button onClick={() => setPaperResetConfirm(false)}
+                    style={{ background: "rgba(255,255,255,0.08)", border: "none", borderRadius: 12, padding: "6px 16px", color: "#fff", fontSize: 12, cursor: "pointer" }}>ביטול</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ══ Add/Edit Position Modal ══ */}
       {portfolioModalOpen && (
         <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:999, display:"flex", alignItems:"flex-end", justifyContent:"center" }}
@@ -1393,6 +1723,7 @@ ${portSnap || "ריק"}
           { id: "stocks", icon: "◈", label: "סורק" },
           { id: "chat", icon: "🤖", label: "סוכן" },
           { id: "portfolio", icon: "◉", label: "תיק" },
+          { id: "paper", icon: "🧪", label: "נייר" },
           { id: "feedback", icon: "💬", label: "פידבק" },
         ].map(t => (
           <button key={t.id} onClick={() => {
@@ -1594,7 +1925,7 @@ ${portSnap || "ריק"}
 }
 
 // ══════════ ROOT WRAPPER ══════════
-export default function App() {
+function App() {
   const [userProfile, setUserProfile] = useState(null);
 
   if (!userProfile) {
@@ -1608,7 +1939,7 @@ export default function App() {
   return <MainApp userProfile={userProfile} />;
 }
   </script>
-  <script type="text/babel">
+  <script type="text/babel" data-presets="react">
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(React.createElement(App));
   </script>
