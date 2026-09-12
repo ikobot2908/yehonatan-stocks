@@ -18,27 +18,14 @@
   <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef } = React;
 
+// מנוע מסחר הנייר טעון כבר כ-<script> גלובלי (paper-trading-engine.js).
+// calcRSI/calcSMA שם הם מקור האמת היחיד — גם עבור הסורק הרגיל למטה — כדי
+// שלא יהיו שני מימושים נפרדים לאותה נוסחה שעלולים להתפצל בטעות עם הזמן.
+const PT = window.PaperTradingEngine;
+
 // ── Safe number helper ──
 const safe = (n, fallback = 0) => (typeof n === "number" && !isNaN(n) ? n : fallback);
 const safeFixed = (n, d = 2, fallback = "—") => typeof n === "number" && !isNaN(n) ? n.toFixed(d) : fallback;
-
-// ── Technical calculations ──
-function calcRSI(candles, period = 14) {
-  if (candles.length < period + 1) return 50;
-  let gains = 0, losses = 0;
-  for (let i = candles.length - period; i < candles.length; i++) {
-    const diff = candles[i].c - candles[i - 1]?.c;
-    if (diff > 0) gains += diff; else losses -= diff;
-  }
-  const rs = gains / (losses || 0.001);
-  return Math.round(100 - 100 / (1 + rs));
-}
-
-function calcSMA(candles, period) {
-  const slice = candles.slice(-period);
-  if (!slice.length) return 0;
-  return +(slice.reduce((s, c) => s + c.c, 0) / slice.length).toFixed(2);
-}
 
 function calcSupRes(candles) {
   if (!candles.length) return { floor: 0, ceiling: 0 };
@@ -54,8 +41,8 @@ function calcSupRes(candles) {
 }
 
 function getTrend(candles) {
-  const sma20 = calcSMA(candles, 20);
-  const sma50 = calcSMA(candles, 50);
+  const sma20 = PT.calcSMA(candles, 20);
+  const sma50 = PT.calcSMA(candles, 50);
   const last = candles[candles.length - 1]?.c || 0;
   if (last > sma20 && sma20 > sma50) return { label: "↑ עולה חזק", color: "#00ffaa" };
   if (last > sma20) return { label: "↑ עולה", color: "#7fff7f" };
@@ -167,9 +154,9 @@ function buildSyntheticCandles(price, changeP, high52, low52) {
 function buildResult(symbol, price, prevClose, candles, extra = {}) {
   const change = +(price - prevClose).toFixed(2);
   const changeP = prevClose ? +((change / prevClose) * 100).toFixed(2) : 0;
-  const rsi = calcRSI(candles);
-  const sma20 = calcSMA(candles, 20);
-  const sma50 = calcSMA(candles, 50);
+  const rsi = PT.calcRSI(candles);
+  const sma20 = PT.calcSMA(candles, 20);
+  const sma50 = PT.calcSMA(candles, 50);
   const { floor, ceiling } = calcSupRes(candles);
   const trend = getTrend(candles);
   const volArr = candles.slice(-20).map(c => c.v).filter(Boolean);
@@ -250,8 +237,7 @@ const PORTFOLIO_BASE = [];
 // ══════════ מסחר נייר (Paper Trading) — הון וירטואלי נפרד לגמרי ══════════
 // מודול עצמאי: לא נוגע בתיק הווירטואלי הרגיל (portfolio/virtualBudget) ובוודאי
 // לא במסחר אמיתי. כל הלוגיקה הכמותית (עמלות, אינדיקטורים, ניקוד, תיק) חיה
-// ב-paper-trading-engine.js הנפרד, שיש לו unit tests משלו.
-const PT = window.PaperTradingEngine;
+// ב-paper-trading-engine.js הנפרד, שיש לו unit tests משלו (PT מוגדר למעלה).
 const PAPER_STORAGE_KEY = "paperTradingState_v1";
 const PAPER_SCAN_INTERVAL_MS = 30 * 60 * 1000; // 30 דק', כמו סריקת ליבת ה-watchlist
 const PAPER_DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL"];
