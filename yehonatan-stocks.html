@@ -882,12 +882,20 @@ ${portSnap || "ריק"}
   // ── שמירת מצב מסחר הנייר בכל שינוי ──
   useEffect(() => { savePaperState(paperState); }, [paperState]);
 
+  // refs כדי שהסריקה תמיד תקרא את המצב/הדגל העדכניים ביותר, גם מתוך
+  // setInterval/callback ישנים — מונע גם ריצה כפולה במקביל וגם תלות
+  // מיותרת של אפקטים בערכי state שמשתנים לעיתים קרובות
+  const paperStateRef = useRef(paperState);
+  useEffect(() => { paperStateRef.current = paperState; }, [paperState]);
+  const paperScanningRef = useRef(false);
+
   // ── סריקת מסחר נייר: טווח → פריצה, לפי כל ה-watchlist הייעודי ──
   async function runPaperScan() {
-    if (paperScanning) return;
+    if (paperScanningRef.current) return;
+    paperScanningRef.current = true;
     setPaperScanning(true);
     const today = new Date().toISOString().slice(0, 10);
-    const state = JSON.parse(JSON.stringify(paperState));
+    const state = JSON.parse(JSON.stringify(paperStateRef.current));
     if (!state.lastPrices) state.lastPrices = {};
     if (!state.baselinePrices) state.baselinePrices = {};
     const newEntries = [];
@@ -966,15 +974,24 @@ ${portSnap || "ריק"}
 
     state.log = [...newEntries, ...state.log].slice(0, 300);
     state.lastScanAt = new Date().toISOString();
+    paperStateRef.current = state;
     setPaperState(state);
+    paperScanningRef.current = false;
     setPaperScanning(false);
   }
 
-  // סריקה אוטומטית כל 30 דק' כל עוד האפליקציה פתוחה (אין שרת רקע בפריסה סטטית זו)
+  // runPaperScan נבנה מחדש בכל רינדור (הוא סוגר על state) — ref שומר תמיד
+  // את הגרסה העדכנית כדי שאפקט עם deps ריקים יוכל לקרוא לה בלי להירשם מחדש
+  const runPaperScanRef = useRef(runPaperScan);
+  useEffect(() => { runPaperScanRef.current = runPaperScan; });
+
+  // סריקה אוטומטית כל 30 דק' כל עוד האפליקציה פתוחה (אין שרת רקע בפריסה סטטית זו).
+  // deps ריקים בכוונה: אחרת כל שינוי ב-paperState (כולל עריכת רשימת המעקב)
+  // היה מאפס את הטיימר ודוחה את הסריקה הבאה ללא הגבלה
   useEffect(() => {
-    const iv = setInterval(runPaperScan, PAPER_SCAN_INTERVAL_MS);
+    const iv = setInterval(() => runPaperScanRef.current(), PAPER_SCAN_INTERVAL_MS);
     return () => clearInterval(iv);
-  }, [paperState, paperScanning]);
+  }, []);
 
   // סריקה מיידית כשנכנסים לטאב אם עברו יותר מ-30 דק' מהסריקה האחרונה
   useEffect(() => {
